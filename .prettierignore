@@ -1,0 +1,7 @@
+.next
+node_modules
+public/pdf.worker.min.mjs
+package-lock.json
+.env*
+artifacts
+test-results

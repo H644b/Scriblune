@@ -1,0 +1,63 @@
+{
+  "name": "scriblune",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0 <27"
+  },
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1",
+    "build": "next build",
+    "start": "node --env-file-if-exists=.env.local .next/standalone/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "worker": "tsx --env-file-if-exists=.env.local src/workers/run.ts",
+    "fixtures": "tsx scripts/fixtures.ts",
+    "setup:check": "tsx --env-file-if-exists=.env.local scripts/check-setup.ts",
+    "postinstall": "node scripts/copy-pdf-worker.mjs",
+    "test:live": "node --env-file-if-exists=.env.local scripts/run-live.mjs",
+    "privacy:admin": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env.operator.local scripts/privacy-admin.ts",
+    "format:check": "prettier --check src tests scripts docs README.md package.json",
+    "test:remote": "node --env-file-if-exists=.env.local --env-file-if-exists=.env.operator.local --import tsx tests/live/remote-flow.ts",
+    "postbuild": "node scripts/prepare-standalone.mjs"
+  },
+  "dependencies": {
+    "@fontsource-variable/dm-sans": "5.3.0",
+    "@fontsource/fraunces": "5.3.0",
+    "@napi-rs/canvas": "1.0.9",
+    "@supabase/ssr": "0.12.7",
+    "@supabase/supabase-js": "2.117.2",
+    "@tanstack/react-query": "5.104.0",
+    "katex": "0.18.9",
+    "lucide-react": "1.49.0",
+    "motion": "13.4.6",
+    "next": "16.3.7",
+    "openai": "7.25.0",
+    "pdf-lib": "1.17.1",
+    "pdfjs-dist": "6.3.289",
+    "postgres": "3.4.9",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-markdown": "10.1.0",
+    "rehype-katex": "7.0.1",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0",
+    "server-only": "0.0.1",
+    "sharp": "0.35.5",
+    "zod": "4.6.5",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "@playwright/test": "1.63.0",
+    "@types/node": "24.19.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "prettier": "3.9.9",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  },
+  "type": "module"
+}
