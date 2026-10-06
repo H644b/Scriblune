@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { requireUser } from "@/lib/supabase/server";
 import { accountTx } from "@/lib/server/db";
-import { requirePilot } from "@/lib/server/config";
 import { sameOrigin, bodyJson, json, failure } from "@/lib/server/errors";
 export async function GET() {
   try {
@@ -26,8 +25,7 @@ export async function POST(request: Request) {
       .discriminatedUnion("action", [
         z
           .object({
-            action: z.literal("attest"),
-            adult: z.literal(true),
+            action: z.literal("profile"),
             display_name: z.string().trim().max(100),
           })
           .strict(),
@@ -53,9 +51,8 @@ export async function POST(request: Request) {
       ])
       .parse(await bodyJson(request));
     await accountTx(u.id, async (tx) => {
-      if (b.action === "attest") {
-        requirePilot();
-        await tx`insert into public.profiles(id,display_name,adult_attested_at) values(${u.id},${b.display_name},now()) on conflict(id) do update set display_name=excluded.display_name`;
+      if (b.action === "profile") {
+        await tx`insert into public.profiles(id,display_name) values(${u.id},${b.display_name}) on conflict(id) do update set display_name=excluded.display_name`;
       }
       if (b.action === "preferences")
         await tx`update public.profiles set preferences_enabled=${b.enabled} where id=${u.id}`;

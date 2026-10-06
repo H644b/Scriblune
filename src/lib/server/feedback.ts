@@ -13,11 +13,55 @@ export async function getQuestions(accountId: string, sessionId: string) {
     const s = await ownedSession(tx, sessionId, { lock: true });
     if (s.status !== "submitted")
       throw new AppError(409, "Finish your session before leaving feedback.");
-    if (s.feedback_submitted) return { received: true, questions: [] };
+    if (s.feedback_submitted)
+      return { received: true, questions: [], is_test: s.is_test };
     const existing = (
       await tx`select questions from public.feedback_question_sets where session_id=${sessionId}`
     )[0];
-    if (existing) return { received: false, questions: existing.questions };
+    if (existing)
+      return {
+        received: false,
+        questions: existing.questions,
+        is_test: s.is_test,
+      };
+    const test = (
+      await tx`select id from private.test_completions where session_id=${sessionId}`
+    )[0];
+    if (test) {
+      const questions: FeedbackQuestion[] = [
+        {
+          id: "test_completion",
+          wording:
+            "You used the tester shortcut to complete this session without a readiness review. Did the transition to this rating page work?",
+          options: ["Yes", "Partly", "No", "Not sure"],
+          related_event_ids: [test.id],
+          dimension: "submission_clarity",
+        },
+        {
+          id: "test_label",
+          wording:
+            "Was it clear that this was a test completion and did not represent a grading approval?",
+          options: ["Yes", "Partly", "No", "Not sure"],
+          related_event_ids: [test.id],
+          dimension: "clarity",
+        },
+        {
+          id: "test_flow",
+          wording:
+            "How did the controls in this test session behave? Use the notes below for reproduction steps.",
+          options: [
+            "As expected",
+            "Minor issues",
+            "Major issues",
+            "Not tested",
+          ],
+          related_event_ids: [test.id],
+          dimension: "workspace_connection",
+        },
+      ];
+      await tx`insert into public.feedback_question_sets(session_id,questions,generator_version) values(${sessionId},${tx.json(questions)},'test-workflow-1')`;
+      return { received: false, questions, is_test: true };
+    }
     const submission = (
       await tx`select id,review_id from public.submissions where session_id=${sessionId}`
     )[0];
@@ -50,7 +94,7 @@ export async function getQuestions(accountId: string, sessionId: string) {
         "Could not prepare grounded feedback questions. You can skip feedback.",
       );
     await tx`insert into public.feedback_question_sets(session_id,questions,generator_version) values(${sessionId},${tx.json(questions)},${FEEDBACK_VERSION})`;
-    return { received: false, questions };
+    return { received: false, questions, is_test: s.is_test };
   });
 }
 export const feedbackInput = z
@@ -112,7 +156,7 @@ export async function saveFeedback(
         ),
       )
       .map((q) => q.dimension);
-    await tx`insert into private.session_feedback(id,session_id,account_id,rating,subject,notes,generator_version,issue_category) values(${feedbackId},${sessionId},${accountId},${input.rating},${s.subject},${input.notes},${set.generator_version},${categories[0] || "general"})`;
+    await tx`insert into private.session_feedback(id,session_id,account_id,rating,subject,notes,generator_version,issue_category,is_test) values(${feedbackId},${sessionId},${accountId},${input.rating},${s.subject},${input.notes},${set.generator_version},${categories[0] || "general"},${s.is_test})`;
     for (const q of questions) {
       const a = input.answers.find((a) => a.question_id === q.id);
       await tx`insert into private.feedback_answers(feedback_id,account_id,question_id,question_wording,options,answer,elaboration,related_event_ids) values(${feedbackId},${accountId},${q.id},${q.wording},${tx.json(q.options)},${a?.answer ?? null},${a?.elaboration || ""},${q.related_event_ids})`;

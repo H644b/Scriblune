@@ -119,6 +119,7 @@ export async function reviewWork(
     [{ role: "user", content }],
     reviewSchema,
     AbortSignal.timeout(100_000),
+    { operation: "review" },
   );
   const ids = new Set(rubric.criteria.map((c) => c.id));
   if (

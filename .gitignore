@@ -2,6 +2,7 @@ node_modules/
 .next/
 .env*
 !.env.example
+!.env.deploy.example
 coverage/
 test-results/
 playwright-report/
@@ -11,3 +12,6 @@ supabase/.temp/
 public/pdf.worker.min.mjs
 artifacts/
 .local/
+.wrangler/
+.dev.vars*
+ssh.key

@@ -1,4 +1,8 @@
 "use client";
+import { notifyVpnBlocked, VPN_BLOCKED_EVENT } from "@/lib/network-policy";
+import { SessionTitle } from "./session-title";
+import { ThemeToggle } from "./theme";
+import { RoomTestTools } from "./test-tools";
 import { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
@@ -57,11 +61,29 @@ import {
   type Tool,
   emptyGeometry,
   defaultStyle,
-  actionInputSchema,
 } from "@/lib/workspace/types";
-import { applyAction, applyCommitted } from "@/lib/workspace/scene";
+import {
+  applyAction,
+  applyCommitted,
+  workChanges,
+} from "@/lib/workspace/scene";
 import { bounds, selectedRegion } from "@/lib/workspace/geometry";
 import { plotPoints } from "@/lib/workspace/expression";
+import {
+  InkSaveQueue,
+  InkSaveError,
+  mergeInkReceipt,
+  overlayPending,
+  recoverInk,
+  inkJournal,
+  type InkReceipt,
+} from "@/lib/workspace/save-queue";
+import {
+  copyAnnotationImage,
+  annotationImage,
+} from "@/lib/workspace/clipboard";
+import { copyKamiDrawings } from "@/lib/workspace/kami-clipboard";
+import syncStyles from "./annotation-sync.module.css";
 const uuid = () => crypto.randomUUID();
 export function WorkspaceLoader({ sessionId }: { sessionId: string }) {
   const q = useQuery({
@@ -130,9 +152,19 @@ export function WorkspaceRoom({
     } | null>(null),
     [recovery, setRecovery] = useState(false),
     [includeTutor, setIncludeTutor] = useState(false),
-    [newPin, setNewPin] = useState("");
-  const pending = useRef<ActionInput[][]>([]),
-    saving = useRef(false),
+    [newPin, setNewPin] = useState(""),
+    [copyNotice, setCopyNotice] = useState(""),
+    [copyError, setCopyError] = useState("");
+  const serverRevision = useRef(initial.session.scene_revision),
+    localRevision = useRef(initial.session.scene_revision),
+    ownRevisions = useRef(new Map<string, number>()),
+    recoveryEnabled = useRef(false),
+    recoveryLoaded = useRef(false),
+    recoveryFailed = useRef(false),
+    mounted = useRef(true),
+    preparingTutor = useRef(false),
+    historyBusy = useRef(false),
+    queueRef = useRef<InkSaveQueue | null>(null),
     abort = useRef<AbortController | null>(null),
     turn = useRef<string | null>(null),
     animationQueue = useRef<WorkspaceAction[]>([]),
@@ -161,13 +193,150 @@ export function WorkspaceRoom({
   function patch(fn: (prev: Workspace) => Workspace) {
     replace(fn(wRef.current));
   }
+  recoveryEnabled.current = recovery;
+  function persistInk() {
+    if (demo || recoveryFailed.current) return;
+    try {
+      const key = `scriblune-recovery-${initial.session.id}`;
+      if (recoveryEnabled.current && saveQueue.pending.length)
+        sessionStorage.setItem(key, inkJournal(saveQueue.pending));
+      else sessionStorage.removeItem(key);
+    } catch {
+      if (mounted.current)
+        setError(
+          "Browser recovery storage is unavailable. Keep this tab open until your ink is saved.",
+        );
+    }
+  }
+  if (!queueRef.current)
+    queueRef.current = new InkSaveQueue({
+      sceneRevision: () => serverRevision.current,
+      send: async (actions, keepalive) => {
+        const body = JSON.stringify({ actions });
+        const response = await fetch(
+          `/api/sessions/${initial.session.id}/annotations`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            keepalive:
+              keepalive && new TextEncoder().encode(body).length < 60000,
+            signal: AbortSignal.timeout(20000),
+          },
+        );
+        const result = await response.json().catch(() => null);
+        if (!response.ok) {
+          notifyVpnBlocked(result);
+          throw new InkSaveError(
+            result?.error ||
+              "Your ink could not be saved. It is still available in this tab.",
+            response.status >= 500 || [408, 429].includes(response.status),
+          );
+        }
+        if (!result?.actions)
+          throw new InkSaveError(
+            "The save response was interrupted. Retrying safely.",
+            true,
+          );
+        return result as InkReceipt;
+      },
+      acknowledge: (entries, result) => {
+        result.actions.forEach((action, index) =>
+          ownRevisions.current.set(
+            `${action.object_id}:${entries[index].optimistic.sequence_number}`,
+            action.sequence_number,
+          ),
+        );
+        serverRevision.current = Math.max(
+          serverRevision.current,
+          result.scene_revision,
+        );
+        patch((prev) => mergeInkReceipt(prev, saveQueue.pending, result));
+        for (const group of Object.values(
+          Object.groupBy(result.actions, (a) => a.action_group_id),
+        )) {
+          if (!group?.length) continue;
+          const existing = undoStack.current.findIndex(
+            (events) => events[0]?.action_group_id === group[0].action_group_id,
+          );
+          if (existing >= 0) undoStack.current[existing].push(...group);
+          else undoStack.current.push(group);
+        }
+      },
+      changed: (state, failure) => {
+        persistInk();
+        if (!mounted.current) return;
+        setSaveState(
+          {
+            saved: "Saved",
+            waiting: "Waiting for a pause",
+            saving: "Saving in background",
+            retrying: "Offline or interrupted · Retrying",
+            blocked: "Not saved · Retry",
+          }[state],
+        );
+        if (failure && state === "blocked")
+          setError(
+            `${failure.message} Your unsaved ink is retained in this tab.`,
+          );
+      },
+    });
+  const saveQueue = queueRef.current;
+  function replaceRemote(next: Workspace) {
+    if (next.session.scene_revision < serverRevision.current) {
+      // A refresh started before a save completed. Keep the newer ink and its
+      // revisions while still accepting messages and other refreshed metadata.
+      replace({
+        ...next,
+        objects: wRef.current.objects,
+        events: wRef.current.events,
+        session: {
+          ...next.session,
+          scene_revision: wRef.current.session.scene_revision,
+          work_revision: Math.max(
+            next.session.work_revision,
+            wRef.current.session.work_revision,
+          ),
+        },
+      });
+      return;
+    }
+    serverRevision.current = next.session.scene_revision;
+    replace(overlayPending(next, saveQueue.pending));
+  }
+  const finishingTurn = useRef<Promise<void> | null>(null);
+  function finishTutor() {
+    if (finishingTurn.current) return finishingTurn.current;
+    const generation = cancelGeneration.current;
+    const pendingFinish = (async () => {
+      // Keep the streamed bubble visible until its persisted replacement is ready.
+      const next = demo
+        ? null
+        : await api<Workspace>(`/api/sessions/${wRef.current.session.id}`);
+      if (generation !== cancelGeneration.current) return;
+      if (next) replaceRemote(next);
+      setStreamText("");
+      setBusy(false);
+      setActivity("Ready");
+    })();
+    finishingTurn.current = pendingFinish;
+    return pendingFinish.finally(() => {
+      finishingTurn.current = null;
+    });
+  }
   async function refresh() {
-    if (demo || pending.current.length || busy || animationRunning.current)
+    if (
+      demo ||
+      saveQueue.pending.length ||
+      saveQueue.isSaving ||
+      busy ||
+      animationRunning.current
+    )
       return;
     const next = await api<Workspace>(
       `/api/sessions/${wRef.current.session.id}`,
     );
-    replace(next);
+    replaceRemote(next);
     if (!active && next.pages.length)
       setActive(next.session.active_page_id || next.pages[0].id);
   }
@@ -183,48 +352,25 @@ export function WorkspaceRoom({
           }
         }
       } catch {}
-    } else {
-      const stored = sessionStorage.getItem(
-        `scriblune-recovery-${initial.session.id}`,
-      );
-      if (stored) {
-        try {
-          const recovered = actionInputSchema
-            .array()
-            .max(100)
-            .array()
-            .max(100)
-            .parse(JSON.parse(stored));
-          pending.current = recovered;
-          let objects = initial.objects;
-          let revision = initial.session.scene_revision;
-          for (const input of recovered.flat()) {
-            if (initial.events.some((e) => e.action_id === input.action_id))
-              continue;
-            const p = initial.pages.find((p) => p.id === input.page_id);
-            if (!p) continue;
-            try {
-              const before =
-                objects.find((o) => o.id === input.object_id) || null;
-              const after = applyAction(
-                input,
-                before,
-                "student",
-                ++revision,
-                p,
-              );
-              objects = applyCommitted(objects, {
-                object_id: input.object_id,
-                after,
-              });
-            } catch {
-              /* Retry will report a conflict without discarding the local copy. */
-            }
-          }
-          patch((prev) => ({ ...prev, objects }));
+    } else if (!recoveryLoaded.current) {
+      recoveryLoaded.current = true;
+      try {
+        const stored = sessionStorage.getItem(
+          `scriblune-recovery-${initial.session.id}`,
+        );
+        if (stored) {
+          const recovered = recoverInk(stored, initial);
+          recoveryEnabled.current = true;
           setRecovery(true);
-          setSaveState("Recovered unsaved ink · Retry");
-        } catch {}
+          patch((prev) => overlayPending(prev, recovered));
+          saveQueue.enqueue(recovered);
+        }
+      } catch (e) {
+        recoveryFailed.current = true;
+        setError(
+          (e as Error).message ||
+            "Your unsaved recovery copy could not be restored. It has been retained.",
+        );
       }
     }
     editor.set({
@@ -254,14 +400,55 @@ export function WorkspaceRoom({
     );
   }, []);
   useEffect(() => {
+    mounted.current = true;
+    saveQueue.resume();
+    if (demo) return;
+    let networkBlocked = false;
+    const onNetworkBlocked = () => {
+      networkBlocked = true;
+      persistInk();
+      saveQueue.pause();
+      abort.current?.abort();
+    };
+    const flushOnLeave = () => {
+      persistInk();
+      if (!networkBlocked) void saveQueue.flush(true);
+    };
     const onLeave = (e: BeforeUnloadEvent) => {
-      if (pending.current.length) {
+      if (saveQueue.pending.length) {
+        flushOnLeave();
         e.preventDefault();
         e.returnValue = "";
       }
     };
+    const onVisibility = () => {
+      if (window.document.visibilityState === "hidden") flushOnLeave();
+    };
+    const onOnline = () => {
+      void saveQueue.flush();
+    };
+    const pointerUp = () => saveQueue.activity(false);
+    window.addEventListener(VPN_BLOCKED_EVENT, onNetworkBlocked);
     window.addEventListener("beforeunload", onLeave);
-    return () => window.removeEventListener("beforeunload", onLeave);
+    window.addEventListener("pagehide", flushOnLeave);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("pointerup", pointerUp);
+    window.addEventListener("pointercancel", pointerUp);
+    window.document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      flushOnLeave();
+      mounted.current = false;
+      abort.current?.abort();
+      saveQueue.pause();
+      window.removeEventListener(VPN_BLOCKED_EVENT, onNetworkBlocked);
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      window.removeEventListener("beforeunload", onLeave);
+      window.removeEventListener("pagehide", flushOnLeave);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("pointerup", pointerUp);
+      window.removeEventListener("pointercancel", pointerUp);
+      window.document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
   useEffect(() => {
     if (demo) return;
@@ -273,7 +460,9 @@ export function WorkspaceRoom({
   useEffect(() => {
     function handle(e: KeyboardEvent) {
       if (
-        (e.target as HTMLElement)?.matches("input,textarea,select") ||
+        (e.target as HTMLElement)?.closest(
+          "input,textarea,select,[contenteditable=true]",
+        ) ||
         documentGlobal().querySelector("dialog[open]")
       )
         return;
@@ -281,6 +470,14 @@ export function WorkspaceRoom({
         e.preventDefault();
         if (e.shiftKey) void redo();
         else void undo();
+      } else if (
+        (e.metaKey || e.ctrlKey) &&
+        e.key.toLowerCase() === "c" &&
+        useEditor.getState().selection.length &&
+        !window.getSelection()?.toString()
+      ) {
+        e.preventDefault();
+        void copyInk();
       } else if (["v", "p", "h", "e", "q"].includes(e.key.toLowerCase()))
         editor.set({
           tool: (
@@ -301,7 +498,7 @@ export function WorkspaceRoom({
   function documentGlobal() {
     return window.document;
   }
-  function saveLayout(extra: Record<string, unknown> = {}) {
+  function saveLayout() {
     const s = useEditor.getState();
     const viewport = {
       zoom: s.zoom,
@@ -311,7 +508,6 @@ export function WorkspaceRoom({
     };
     patch((prev) => ({ ...prev, session: { ...prev.session, viewport } }));
     if (demo) return;
-    setSaveState("Saving…");
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       void api(`/api/sessions/${wRef.current.session.id}`, {
@@ -319,11 +515,11 @@ export function WorkspaceRoom({
         body: JSON.stringify({
           active_page_id: active || undefined,
           viewport,
-          ...extra,
         }),
       })
         .then(() => {
-          if (!pending.current.length) setSaveState("Saved");
+          if (!saveQueue.pending.length && !saveQueue.isSaving)
+            setSaveState("Saved");
         })
         .catch((e) => {
           setSaveState("Layout not saved");
@@ -332,6 +528,7 @@ export function WorkspaceRoom({
     }, 500);
   }
   function changePage(id: string) {
+    saveQueue.activity(false);
     setActive(id);
     editor.set({ selection: [], region: null });
     patch((prev) => ({
@@ -348,65 +545,43 @@ export function WorkspaceRoom({
       });
   }
   async function flush() {
-    if (saving.current || demo) return;
-    saving.current = true;
-    setSaveState("Saving…");
-    try {
-      while (pending.current.length) {
-        const actions = pending.current[0];
-        const result = await api<{
-          actions: WorkspaceAction[];
-          scene_revision: number;
-          work_revision: number;
-        }>(`/api/sessions/${wRef.current.session.id}/annotations`, {
-          method: "POST",
-          body: JSON.stringify({ actions }),
-        });
-        patch((prev) => ({
-          ...prev,
-          objects: result.actions.reduce(
-            (acc, a) => applyCommitted(acc, a),
-            prev.objects,
-          ),
-          session: {
-            ...prev.session,
-            scene_revision: Math.max(
-              prev.session.scene_revision,
-              result.scene_revision,
-            ),
-            work_revision: result.work_revision,
-          },
-          events: [...prev.events, ...result.actions],
-        }));
-        undoStack.current.push(result.actions);
-        redoStack.current = [];
-        pending.current.shift();
-        if (recovery)
-          sessionStorage.setItem(
-            `scriblune-recovery-${wRef.current.session.id}`,
-            JSON.stringify(pending.current),
-          );
-      }
-      setSaveState("Saved");
-      sessionStorage.removeItem(
-        `scriblune-recovery-${wRef.current.session.id}`,
+    if (demo) return true;
+    return saveQueue.flush();
+  }
+  async function ensureInkSaved() {
+    if (!(await flush()) || saveQueue.pending.length)
+      throw new Error(
+        "Your ink has not finished saving. Keep this tab open and retry before reviewing, exporting, or asking the tutor.",
       );
-    } catch (e) {
-      setError((e as Error).message);
-      setSaveState("Not saved · Retry");
-    } finally {
-      saving.current = false;
-    }
   }
   async function commit(inputs: ActionInput[]) {
     if (readOnly) return;
+    inputs = inputs.map((input) => {
+      const current = wRef.current.objects.find(
+        (o) => o.id === input.object_id,
+      );
+      const saved = ownRevisions.current.get(
+        `${input.object_id}:${input.base_object_revision}`,
+      );
+      return current && saved === current.revision
+        ? { ...input, base_object_revision: saved }
+        : input;
+    });
     let objects = wRef.current.objects;
     const events: WorkspaceAction[] = [];
-    let rev = wRef.current.session.scene_revision;
+    let rev = Math.max(
+      localRevision.current,
+      wRef.current.session.scene_revision,
+    );
     try {
       for (const input of inputs) {
         const before = objects.find((o) => o.id === input.object_id) || null;
-        const after = applyAction(input, before, "student", ++rev, page!);
+        const actionPage = wRef.current.pages.find(
+          (p) => p.id === input.page_id,
+        );
+        if (!actionPage)
+          throw new Error("This drawing page is no longer available.");
+        const after = applyAction(input, before, "student", ++rev, actionPage);
         objects = applyCommitted(objects, {
           object_id: input.object_id,
           after,
@@ -425,13 +600,18 @@ export function WorkspaceRoom({
       setError((e as Error).message);
       return;
     }
+    localRevision.current = rev;
+    redoStack.current = [];
     patch((prev) => ({
       ...prev,
       objects,
       session: {
         ...prev.session,
         scene_revision: rev,
-        work_revision: prev.session.work_revision + 1,
+        work_revision:
+          prev.session.work_revision +
+          events.filter((e) => workChanges("student", e.before, e.after))
+            .length,
       },
       events: demo ? [...prev.events, ...events] : prev.events,
     }));
@@ -440,14 +620,11 @@ export function WorkspaceRoom({
       redoStack.current = [];
       return;
     }
-    pending.current.push(inputs);
-    if (recovery)
-      sessionStorage.setItem(
-        `scriblune-recovery-${w.session.id}`,
-        JSON.stringify(pending.current),
-      );
-    await flush();
+    saveQueue.enqueue(
+      inputs.map((input, i) => ({ input, optimistic: events[i] })),
+    );
   }
+
   function actionFor(
     g: Geometry,
     o?: Annotation,
@@ -480,17 +657,24 @@ export function WorkspaceRoom({
     };
   }
   async function undo(group?: string) {
-    if (pending.current.length) {
-      setError("Save your pending ink before undoing earlier work.");
-      return;
-    }
-    const events = group
-      ? wRef.current.events.filter(
-          (e) => e.action_group_id === group && e.after,
-        )
-      : undoStack.current.pop();
-    if (!events?.length) return;
+    if (historyBusy.current) return;
+    const target =
+      group ||
+      saveQueue.pending.at(-1)?.input.action_group_id ||
+      undoStack.current.at(-1)?.[0]?.action_group_id;
+    if (!target) return;
+    historyBusy.current = true;
+    let events: WorkspaceAction[] = [];
     try {
+      await ensureInkSaved();
+      events =
+        undoStack.current.find(
+          (items) => items[0]?.action_group_id === target,
+        ) ||
+        wRef.current.events.filter(
+          (e) => e.action_group_id === target && e.object_id,
+        );
+      if (!events.length) return;
       if (demo) {
         patch((prev) => ({
           ...prev,
@@ -516,31 +700,29 @@ export function WorkspaceRoom({
         }>(`/api/sessions/${w.session.id}/undo`, {
           method: "POST",
           body: JSON.stringify({
-            group_id: group || events[0].action_group_id,
+            group_id: target,
             request_id: uuid(),
           }),
         });
-        patch((prev) => ({
-          ...prev,
-          objects: r.actions.reduce(
-            (acc, a) => applyCommitted(acc, a),
-            prev.objects,
-          ),
-          session: {
-            ...prev.session,
-            scene_revision: r.scene_revision,
-            work_revision: r.work_revision,
-          },
-          events: [...prev.events, ...r.actions],
-        }));
+        serverRevision.current = Math.max(
+          serverRevision.current,
+          r.scene_revision,
+        );
+        patch((prev) => mergeInkReceipt(prev, saveQueue.pending, r));
       }
+      undoStack.current = undoStack.current.filter(
+        (items) => items[0]?.action_group_id !== target,
+      );
       redoStack.current.push(events);
       editor.set({ selection: [] });
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      historyBusy.current = false;
     }
   }
   async function redo() {
+    if (historyBusy.current) return;
     const events = redoStack.current.pop();
     if (!events) return;
     const group = uuid();
@@ -562,6 +744,18 @@ export function WorkspaceRoom({
     await commit(inputs);
   }
   function editSelection(action: string) {
+    if (action === "copy-kami") {
+      void copyKamiInk();
+      return;
+    }
+    if (action === "copy-image") {
+      void copyInk();
+      return;
+    }
+    if (action === "download-image") {
+      void downloadInk();
+      return;
+    }
     const group = uuid();
     const s = useEditor.getState();
     void commit(
@@ -687,14 +881,40 @@ export function WorkspaceRoom({
       generation === cancelGeneration.current
     ) {
       const action = animationQueue.current.shift()!;
+      serverRevision.current = Math.max(
+        serverRevision.current,
+        action.sequence_number,
+      );
       const after = action.after;
       if (!after) {
         if (replay) continue;
         patch((prev) => ({
           ...prev,
-          objects: applyCommitted(prev.objects, action),
-          events: [...prev.events, action],
+          objects: saveQueue.pending.some(
+            (e) => e.input.object_id === action.object_id,
+          )
+            ? prev.objects
+            : applyCommitted(prev.objects, action),
+          events: prev.events.some((e) => e.action_id === action.action_id)
+            ? prev.events
+            : [...prev.events, action],
+          session: {
+            ...prev.session,
+            scene_revision: Math.max(
+              prev.session.scene_revision,
+              action.sequence_number,
+            ),
+          },
         }));
+        // A displayed deletion must survive cancellation just like displayed ink.
+        if (!demo && turn.current)
+          await api(`/api/sessions/${w.session.id}/ack`, {
+            method: "POST",
+            body: JSON.stringify({
+              turn_id: turn.current,
+              action_id: action.action_id,
+            }),
+          }).catch(() => {});
         continue;
       }
       if (useEditor.getState().follow) {
@@ -760,7 +980,11 @@ export function WorkspaceRoom({
       if (!replay)
         patch((prev) => ({
           ...prev,
-          objects: applyCommitted(prev.objects, action),
+          objects: saveQueue.pending.some(
+            (e) => e.input.object_id === action.object_id,
+          )
+            ? prev.objects
+            : applyCommitted(prev.objects, action),
           events: prev.events.some((e) => e.action_id === action.action_id)
             ? prev.events
             : [...prev.events, action],
@@ -784,13 +1008,12 @@ export function WorkspaceRoom({
     }
     animationRunning.current = false;
     if (streamDone.current) {
-      setBusy(false);
-      setActivity("Ready");
-      setStreamText("");
-      if (!demo) {
-        const next = await api<Workspace>(`/api/sessions/${w.session.id}`);
-        replace(next);
-      }
+      await finishTutor().catch(() => {
+        setBusy(false);
+        setError(
+          "Your response is still visible. Reconnect to confirm its saved version.",
+        );
+      });
     }
   }
   async function stop() {
@@ -806,7 +1029,7 @@ export function WorkspaceRoom({
           body: JSON.stringify({ turn_id: turn.current }),
         });
         const next = await api<Workspace>(`/api/sessions/${w.session.id}`);
-        replace(next);
+        replaceRemote(next);
       } catch (e) {
         setError(
           "The stop request could not be confirmed. Reconnect to check the saved explanation.",
@@ -818,15 +1041,16 @@ export function WorkspaceRoom({
     setStreamText("");
   }
   async function send(text: string) {
-    if (demo || busy || !page) return;
-    if (pending.current.length) {
-      await flush();
-      if (pending.current.length) {
-        setError(
-          "Save your ink before asking the tutor, so it sees your latest work.",
-        );
-        return;
-      }
+    if (demo || busy || preparingTutor.current || !page) return false;
+    preparingTutor.current = true;
+    setBusy(true);
+    try {
+      await ensureInkSaved();
+    } catch (error) {
+      preparingTutor.current = false;
+      setBusy(false);
+      setError((error as Error).message);
+      return false;
     }
     setError("");
     setBusy(true);
@@ -835,6 +1059,7 @@ export function WorkspaceRoom({
     abort.current = new AbortController();
     const turnId = uuid();
     turn.current = turnId;
+    let accepted = false;
     try {
       const response = await fetch(`/api/sessions/${w.session.id}/chat`, {
         method: "POST",
@@ -850,14 +1075,15 @@ export function WorkspaceRoom({
       });
       if (!response.ok) {
         const b = await response.json();
+        notifyVpnBlocked(b);
         throw new Error(b.error);
       }
+      accepted = true;
       if (
         !response.headers.get("content-type")?.includes("text/event-stream")
       ) {
-        await refresh();
-        setBusy(false);
-        return;
+        await finishTutor();
+        return true;
       }
       const reader = response.body!.getReader(),
         decoder = new TextDecoder();
@@ -891,6 +1117,18 @@ export function WorkspaceRoom({
           if (event.type === "delta") setStreamText((t) => t + event.text);
           if (event.type === "activity") setActivity(event.activity);
           if (event.type === "focus") setFocus(event);
+          if (event.type === "page_added")
+            patch((prev) => ({
+              ...prev,
+              pages: [
+                ...prev.pages.filter((p) => p.id !== event.page.id),
+                event.page,
+              ],
+              documents: [
+                ...prev.documents.filter((d) => d.id !== event.document.id),
+                event.document,
+              ],
+            }));
           if (event.type === "action") {
             animationQueue.current.push(event.action);
             void animationLoop();
@@ -901,15 +1139,16 @@ export function WorkspaceRoom({
       }
       streamDone.current = true;
       if (!animationRunning.current) {
-        setBusy(false);
-        setActivity("Ready");
-        setStreamText("");
-        replace(await api<Workspace>(`/api/sessions/${w.session.id}`));
+        await finishTutor();
       }
+      return true;
     } catch (e) {
       if ((e as Error).name !== "AbortError") setError((e as Error).message);
       setBusy(false);
       setActivity("Reconnecting");
+      return accepted;
+    } finally {
+      preparingTutor.current = false;
     }
   }
   function sample() {
@@ -1118,7 +1357,59 @@ export function WorkspaceRoom({
     }
     setNewPin("");
   }
+  function inkForCopy(wholePage = false) {
+    const state = useEditor.getState();
+    return wRef.current.objects.filter(
+      (o) =>
+        o.page_id === page?.id &&
+        o.visible &&
+        state.layers[o.actor] &&
+        (wholePage
+          ? o.actor === "student" || includeTutor
+          : state.selection.includes(o.id)),
+    );
+  }
+  async function copyKamiInk(wholePage = false) {
+    if (!page) return;
+    setCopyNotice("");
+    setCopyError("");
+    try {
+      await copyKamiDrawings(inkForCopy(wholePage), page);
+      setCopyNotice(
+        "Drawings copied in Kami’s clipboard format. Open your Kami page and paste. If it is not accepted, use image copy.",
+      );
+    } catch (error) {
+      setCopyError((error as Error).message);
+      setError((error as Error).message);
+    }
+  }
+  async function copyInk(wholePage = false) {
+    setCopyNotice("");
+    setCopyError("");
+    try {
+      await copyAnnotationImage(inkForCopy(wholePage));
+      setCopyNotice(
+        "Ink copied as an image. Paste in an app that accepts images; individual marks are flattened.",
+      );
+    } catch (error) {
+      setCopyError((error as Error).message);
+      setError((error as Error).message);
+    }
+  }
+  async function downloadInk(wholePage = false) {
+    setCopyError("");
+    try {
+      downloadBlob(
+        await annotationImage(inkForCopy(wholePage)),
+        "scriblune-ink.png",
+      );
+    } catch (error) {
+      setCopyError((error as Error).message);
+      setError((error as Error).message);
+    }
+  }
   async function exportWork() {
+    await ensureInkSaved();
     if (demo) {
       const { PDFDocument } = await import("pdf-lib");
       const pdf = await PDFDocument.create();
@@ -1171,6 +1462,7 @@ export function WorkspaceRoom({
       );
       if (!response.ok) {
         const e = await response.json();
+        notifyVpnBlocked(e);
         throw new Error(e.error);
       }
       downloadBlob(await response.blob(), "scriblune-assignment.pdf");
@@ -1184,12 +1476,45 @@ export function WorkspaceRoom({
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  const liveObjects = animationObject
-    ? [...w.objects.filter((o) => o.id !== animationObject.id), animationObject]
-    : w.objects;
+  const liveObjects =
+    animationObject &&
+    !saveQueue.pending.some((e) => e.input.object_id === animationObject.id)
+      ? [
+          ...w.objects.filter((o) => o.id !== animationObject.id),
+          animationObject,
+        ]
+      : w.objects;
   return (
     <div
       className={`study-room mobile-${mobileView}`}
+      onPointerMoveCapture={() => saveQueue.activity()}
+      onKeyDownCapture={() => saveQueue.activity()}
+      onClickCapture={(e) => {
+        const anchor = (e.target as Element).closest<HTMLAnchorElement>(
+          "a[href]",
+        );
+        if (
+          !anchor ||
+          demo ||
+          !saveQueue.pending.length ||
+          e.metaKey ||
+          e.ctrlKey ||
+          e.shiftKey ||
+          anchor.target === "_blank" ||
+          anchor.hasAttribute("download")
+        )
+          return;
+        const url = new URL(anchor.href, location.href);
+        if (
+          url.origin !== location.origin ||
+          url.pathname === location.pathname
+        )
+          return;
+        e.preventDefault();
+        void ensureInkSaved()
+          .then(() => location.assign(url.href))
+          .catch((error) => setError(error.message));
+      }}
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => {
         e.preventDefault();
@@ -1209,34 +1534,21 @@ export function WorkspaceRoom({
         <Logo />
         <span className="header-divider" />
         <div className="session-name">
-          <input
-            aria-label="Session title"
-            value={w.session.title}
-            onChange={(e) =>
+          <SessionTitle
+            id={w.session.id}
+            title={w.session.title}
+            updatedAt={w.session.updated_at || "1970-01-01T00:00:00Z"}
+            demo={demo}
+            onSaved={(title) =>
               patch((prev) => ({
                 ...prev,
-                session: { ...prev.session, title: e.target.value },
+                session: { ...prev.session, title },
               }))
             }
-            onBlur={() => saveLayout({ title: w.session.title })}
-            maxLength={160}
           />
-          <button
-            className={`save-status ${saveState.includes("Not") ? "unsaved" : ""}`}
-            onClick={() => void flush()}
-            title="Save status"
-          >
-            {saveState === "Saving…" ? (
-              <LoaderCircle className="spin" size={11} />
-            ) : saveState.includes("Not") ? (
-              <CloudOff size={12} />
-            ) : (
-              <Check size={12} />
-            )}{" "}
-            {saveState}
-          </button>
         </div>
         <div className="room-header-actions">
+          <ThemeToggle />
           {demo ? (
             <button className="text-button" onClick={() => setAuthOpen(true)}>
               Start a real session
@@ -1262,6 +1574,20 @@ export function WorkspaceRoom({
           </button>
         </div>
       </header>
+      {!demo && (
+        <RoomTestTools
+          id={w.session.id}
+          isTest={w.session.is_test}
+          submitted={w.session.status === "submitted"}
+          beforeComplete={async () => {
+            await flush();
+            if (saveQueue.isSaving || saveQueue.pending.length)
+              throw new Error(
+                "Wait for your ink to finish saving, then retry.",
+              );
+          }}
+        />
+      )}
       {demo && (
         <div className="demo-ribbon">
           <span>YOUR SANDBOX</span> Sample assignment · drawings save on this
@@ -1283,6 +1609,18 @@ export function WorkspaceRoom({
           <MessageSquare size={16} /> Tutor & chat
         </button>
       </div>
+      {copyNotice && (
+        <div className={syncStyles.copyNotice} role="status">
+          <span>{copyNotice}</span>
+          <button
+            className="icon-button"
+            aria-label="Dismiss copy notice"
+            onClick={() => setCopyNotice("")}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
       {error && (
         <div className="room-error" role="alert">
           {error}
@@ -1371,6 +1709,23 @@ export function WorkspaceRoom({
               <Search size={16} />
             </button>
           </div>
+          <div className={syncStyles.syncBar} role="status">
+            <button
+              className={`save-status ${saveState.includes("Not") ? "unsaved" : ""}`}
+              onClick={() => void flush()}
+              title="Save now or retry unsaved ink"
+              aria-label={`Ink sync: ${saveState}`}
+            >
+              {saveState === "Saving in background" ? (
+                <LoaderCircle className="spin" size={11} />
+              ) : saveState.includes("Not") ? (
+                <CloudOff size={12} />
+              ) : (
+                <Check size={12} />
+              )}{" "}
+              {saveState}
+            </button>
+          </div>
           {w.jobs.some((j) => !["complete", "failed"].includes(j.status)) && (
             <div className="processing-strip">
               <LoaderCircle size={13} className="spin" />{" "}
@@ -1446,6 +1801,7 @@ export function WorkspaceRoom({
                   revision={w.session.scene_revision}
                   disabled={readOnly}
                   onCommit={commit}
+                  onInteraction={(active) => saveQueue.activity(active)}
                   onError={setError}
                   onText={(kind, p) => {
                     setTextKind(kind);
@@ -1463,7 +1819,9 @@ export function WorkspaceRoom({
                 />
                 <DrawingToolbar
                   selected={selected}
-                  canUndo={undoStack.current.length > 0}
+                  canUndo={
+                    undoStack.current.length > 0 || saveQueue.pending.length > 0
+                  }
                   canRedo={redoStack.current.length > 0}
                   onUndo={() => void undo()}
                   onRedo={() => void redo()}
@@ -1633,9 +1991,10 @@ export function WorkspaceRoom({
         <Chat
           messages={w.messages}
           streamText={streamText}
+          streamTurnId={turn.current}
           activity={activity}
           busy={busy}
-          onSend={(text) => void send(text)}
+          onSend={send}
           onStop={() => void stop()}
           onAttach={() => setModal("upload")}
           onReference={reference}
@@ -2057,11 +2416,10 @@ export function WorkspaceRoom({
                 type="checkbox"
                 checked={recovery}
                 onChange={(e) => {
+                  recoveryFailed.current = false;
+                  recoveryEnabled.current = e.target.checked;
                   setRecovery(e.target.checked);
-                  if (!e.target.checked)
-                    sessionStorage.removeItem(
-                      `scriblune-recovery-${w.session.id}`,
-                    );
+                  persistInk();
                 }}
               />{" "}
               Keep unsaved drawing actions temporarily in this browser tab for
@@ -2110,6 +2468,56 @@ export function WorkspaceRoom({
           >
             <Download size={16} /> Download assignment
           </button>
+          <h3>Copy ink to Kami or another app</h3>
+          <p className="muted small-copy">
+            Copy drawings for Kami keeps pen strokes and shapes as separate
+            drawings using Kami’s clipboard format. Text, sticky notes, and
+            bucket fills can be copied as a transparent image instead; the image
+            is flattened.
+          </p>
+          <div className={syncStyles.imageActions}>
+            <button
+              className="button secondary"
+              onClick={() => void copyKamiInk(true)}
+            >
+              Copy drawings for Kami
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void copyInk(true)}
+            >
+              Copy page ink
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void downloadInk(true)}
+            >
+              Download ink PNG
+            </button>
+          </div>
+          {copyNotice && (
+            <p role="status" className="muted small-copy">
+              {copyNotice}
+            </p>
+          )}
+          {copyError && (
+            <p role="alert" className="error">
+              {copyError}
+            </p>
+          )}
+          <p className="muted small-copy">
+            Open your Kami document and paste the copied drawings. This
+            compatibility option is based on a Kami clipboard sample and still
+            needs confirmation in your Kami session. For the PNG fallback, try
+            image paste or Add Media → My Computer (a paid Kami feature).{" "}
+            <a
+              href="https://help.kamiapp.com/kami-help-center/add-media-tool"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Kami’s image guide
+            </a>
+          </p>
           {!demo && (
             <a
               className="button secondary full"
@@ -2129,6 +2537,7 @@ export function WorkspaceRoom({
         onClose={() => setModal("")}
         workspace={w}
         onRefresh={refresh}
+        beforeAction={ensureInkSaved}
         demo={demo}
       />
       <AuthModal

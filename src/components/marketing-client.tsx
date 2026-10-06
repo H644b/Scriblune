@@ -1,5 +1,6 @@
 "use client";
-import { useEffect, useState } from "react";
+import { ThemeToggle } from "@/components/theme";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -18,15 +19,25 @@ import {
 import { AuthModal } from "./auth-modal";
 import { Logo, Mark } from "./brand";
 import { SamplePage } from "./sample-page";
-import { browserAuth } from "@/lib/supabase/browser";
 import { api } from "@/lib/client-api";
+import { useQuery } from "@tanstack/react-query";
+import { Avatar } from "./community-shared";
+import { UpgradeLink } from "./billing-usage";
 export function MarketingHeader() {
   const [open, setOpen] = useState(false);
+  const profile = useQuery({
+    queryKey: ["header-profile"],
+    queryFn: () =>
+      api<{ signedIn: boolean; avatar?: string; username?: string }>(
+        "/api/account/summary",
+      ),
+    retry: 1,
+  });
   const router = useRouter();
   async function start() {
     try {
-      const { data } = await browserAuth().auth.getUser();
-      if (data.user) {
+      const data = await api<{ authenticated: boolean }>("/api/auth");
+      if (data.authenticated) {
         router.push("/desk");
         return;
       }
@@ -41,11 +52,31 @@ export function MarketingHeader() {
           <a href="#how-it-works">How it works</a>
           <a href="#shared-ink">The workspace</a>
           <a href="/features/memory-pins">Made for your mind</a>
+          <a href="/forum">Community</a>
         </nav>
         <div className="header-actions">
-          <button className="text-button" onClick={() => setOpen(true)}>
-            Sign in
-          </button>
+          <ThemeToggle />
+          {profile.data?.signedIn ? (
+            <>
+              <UpgradeLink />
+              <Link
+                className="header-profile"
+                href="/account"
+                aria-label="Account settings"
+                title={
+                  profile.data.username
+                    ? `@${profile.data.username} · Account settings`
+                    : "Account settings"
+                }
+              >
+                <Avatar src={profile.data.avatar} size={38} />
+              </Link>
+            </>
+          ) : (
+            <button className="text-button" onClick={() => setOpen(true)}>
+              Sign in
+            </button>
+          )}
           <button className="button small ink" onClick={start}>
             Find your flow <Sparkles size={15} />
           </button>
@@ -70,6 +101,7 @@ export function StartButton({
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const requestId = useRef<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const router = useRouter();
@@ -78,9 +110,13 @@ export function StartButton({
     try {
       const s = await api<{ id: string }>("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({ title: "A new beginning", adult: true }),
+        body: JSON.stringify({
+          title: "A new beginning",
+          request_id: (requestId.current ??= crypto.randomUUID()),
+        }),
       });
       router.push(`/study/${s.id}`);
+      requestId.current = null;
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -88,8 +124,8 @@ export function StartButton({
     }
   }
   async function start() {
-    const { data } = await browserAuth().auth.getUser();
-    if (data.user) await create();
+    const data = await api<{ authenticated: boolean }>("/api/auth");
+    if (data.authenticated) await create();
     else setOpen(true);
   }
   return (
@@ -220,7 +256,7 @@ export function ResumeAuth() {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     const params = new URLSearchParams(location.search);
-    if (params.has("signin")) setOpen(true);
+    if (params.has("signin") || params.has("signup")) setOpen(true);
   }, []);
   return (
     <AuthModal
@@ -230,7 +266,7 @@ export function ResumeAuth() {
         const next = new URLSearchParams(location.search).get("next");
         location.href =
           next &&
-          /^\/(study\/[0-9a-f-]+|feedback\/[0-9a-f-]+|desk|account|admin)$/.test(
+          /^\/(study\/[0-9a-f-]+|feedback\/[0-9a-f-]+|desk|account|admin|plans)$/.test(
             next,
           )
             ? next

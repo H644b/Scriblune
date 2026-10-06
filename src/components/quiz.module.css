@@ -1,0 +1,198 @@
+.form {
+  gap: 1rem;
+}
+.form label:not(.check) {
+  display: grid;
+  gap: 0.5rem;
+}
+.form input:not([type="checkbox"]),
+.form select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.7rem;
+  border: 1px solid var(--line, #dedbd3);
+  border-radius: 10px;
+  color: inherit;
+  background: transparent;
+}
+.form fieldset {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.form legend {
+  font-weight: 600;
+  margin-bottom: 0.6rem;
+}
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  line-height: 1.5;
+}
+.check input {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin-top: 4px;
+  accent-color: #617459;
+}
+.sources {
+  display: grid;
+  gap: 0.6rem;
+  max-height: 170px;
+  overflow: auto;
+}
+.settings {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1rem;
+}
+.actions {
+  display: flex;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+.room {
+  max-width: 850px;
+  padding: 48px 24px 100px;
+  margin: 0 auto;
+}
+.room h1 {
+  margin: 0.8rem 0;
+  overflow-wrap: anywhere;
+}
+.sourceDetails {
+  padding: 1rem 0;
+  overflow-wrap: anywhere;
+}
+.sourceDetails summary {
+  cursor: pointer;
+}
+.progress {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1.5rem 0;
+  font-size: 0.9rem;
+}
+.question {
+  border: 1px solid var(--line, #dedbd3);
+  padding: 24px;
+  border-radius: 18px;
+  margin: 0 0 26px;
+  min-width: 0;
+}
+.question legend {
+  padding: 0 10px;
+  font-weight: 600;
+}
+.prompt {
+  font-size: 1.12rem;
+  line-height: 1.65;
+  margin-bottom: 22px;
+  overflow-wrap: anywhere;
+}
+.options {
+  display: grid;
+  gap: 12px;
+}
+.option {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  border: 1px solid var(--line, #dedbd3);
+  border-radius: 12px;
+  padding: 15px;
+  cursor: pointer;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.option input {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  margin-top: 2px;
+  accent-color: #617459;
+}
+.option span {
+  min-width: 0;
+}
+.option p {
+  margin: 0;
+}
+.selected {
+  border-color: #748665;
+  background: color-mix(in srgb, #899a77 10%, transparent);
+}
+.correct {
+  border-color: #6b8b5d;
+  background: color-mix(in srgb, #75a15e 13%, transparent);
+}
+.option small {
+  display: block;
+  margin-top: 8px;
+  font-weight: 600;
+}
+.explanation {
+  margin-top: 24px;
+  line-height: 1.65;
+}
+.result {
+  display: flex;
+  gap: 18px;
+  padding: 24px;
+  background: color-mix(in srgb, #75a15e 13%, transparent);
+  border-radius: 18px;
+  margin: 24px 0;
+}
+.result h2 {
+  font-size: 1.45rem;
+  margin: 0;
+}
+.result p {
+  margin-bottom: 0;
+}
+.wait {
+  padding: 40px 20px;
+  margin: 24px 0;
+  border: 1px solid var(--line, #dedbd3);
+  border-radius: 18px;
+  line-height: 1.6;
+}
+.submit {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  margin-top: 30px;
+}
+.submit p {
+  max-width: 350px;
+}
+@media (max-width: 600px) {
+  .room {
+    padding: 30px 16px 70px;
+  }
+  .question {
+    padding: 16px;
+  }
+  .settings {
+    grid-template-columns: 1fr;
+  }
+  .submit {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .actions {
+    width: 100%;
+  }
+  .actions button {
+    flex: 1;
+  }
+}
+
+.incorrect {
+  border-color: #b16e50;
+  background: color-mix(in srgb, #b16e50 12%, transparent);
+}

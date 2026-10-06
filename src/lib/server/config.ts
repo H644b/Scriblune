@@ -8,16 +8,11 @@ export function setupState() {
     storage: !!process.env.SUPABASE_SECRET_KEY,
     tutor: !!process.env.OPENAI_API_KEY && !!process.env.AI_TUTOR_MODEL,
     review: !!process.env.OPENAI_API_KEY && !!process.env.AI_REVIEW_MODEL,
-    pilot: process.env.ALLOW_ADULT_PILOT === "true",
+    email:
+      !!process.env.RESEND_API_KEY &&
+      !!process.env.RESEND_FROM_EMAIL &&
+      !!process.env.AUTH_SECRET,
   };
-}
-export function requirePilot() {
-  if (!setupState().pilot)
-    throw new AppError(
-      503,
-      "Scriblune’s adult pilot is not open yet. You can explore the sample workspace while setup is completed.",
-      "SETUP_REQUIRED",
-    );
 }
 export function requireAI(kind: "tutor" | "review") {
   if (!setupState()[kind])

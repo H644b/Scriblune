@@ -1,0 +1,2 @@
+// Runs in <head> before paint. No account information is stored in this preference.
+export const themeBootstrap = `(function(){try{var p=localStorage.getItem('scriblune-appearance');if(p!=='light'&&p!=='dark')p='system';var t=p==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):p;document.documentElement.dataset.theme=t;document.documentElement.dataset.appearance=p}catch(e){document.documentElement.dataset.theme=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}})()`;

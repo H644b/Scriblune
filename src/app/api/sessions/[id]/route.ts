@@ -38,7 +38,7 @@ export async function PATCH(request: Request, c: Context) {
       })
       .strict()
       .parse(await bodyJson(request));
-    await accountTx(u.id, async (tx) => {
+    const saved = await accountTx(u.id, async (tx) => {
       await ownedSession(tx, id);
       if (
         b.active_page_id &&
@@ -48,13 +48,16 @@ export async function PATCH(request: Request, c: Context) {
       )
         throw new AppError(400, "Invalid page.");
       if (b.title)
-        await tx`update public.tutoring_sessions set title=${b.title} where id=${id}`;
+        await tx`update public.tutoring_sessions set title=${b.title},updated_at=now() where id=${id}`;
       if (b.active_page_id)
         await tx`update public.tutoring_sessions set active_page_id=${b.active_page_id} where id=${id}`;
       if (b.viewport)
         await tx`update public.tutoring_sessions set viewport=${tx.json(b.viewport)} where id=${id}`;
+      return (
+        await tx`select title,updated_at from public.tutoring_sessions where id=${id}`
+      )[0];
     });
-    return json({ saved: true });
+    return json({ saved: true, ...saved });
   } catch (e) {
     return failure(e);
   }

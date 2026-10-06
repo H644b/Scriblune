@@ -5,18 +5,18 @@ import Link from "next/link";
 import { Star, ShieldCheck, CheckCircle2 } from "lucide-react";
 import { Logo } from "./brand";
 import { api } from "@/lib/client-api";
-import { PrivacyQueue } from "./privacy-queue";
-export function AdminPanel() {
+export function AdminPanel({ canTriage = true }: { canTriage?: boolean }) {
+  const [test, setTest] = useState("regular");
   const [rating, setRating] = useState("0"),
     [status, setStatus] = useState("all"),
     [category, setCategory] = useState(""),
     [subject, setSubject] = useState(""),
     [error, setError] = useState("");
   const q = useQuery({
-    queryKey: ["admin-feedback", rating, status, category, subject],
+    queryKey: ["admin-feedback", rating, status, category, subject, test],
     queryFn: () =>
       api<{ feedback: any[]; aggregation: any[] }>(
-        `/api/admin/feedback?${new URLSearchParams({ rating, status, category, subject })}`,
+        `/api/admin/feedback?${new URLSearchParams({ rating, status, category, subject, test })}`,
       ),
   });
   const accounts = Object.groupBy(
@@ -57,6 +57,14 @@ export function AdminPanel() {
           before making product changes.
         </p>
         <div className="admin-filters">
+          <label>
+            Feedback source
+            <select value={test} onChange={(e) => setTest(e.target.value)}>
+              <option value="regular">Regular sessions</option>
+              <option value="test">Test sessions</option>
+              <option value="all">All sessions</option>
+            </select>
+          </label>
           <label>
             Rating
             <select value={rating} onChange={(e) => setRating(e.target.value)}>
@@ -141,7 +149,10 @@ export function AdminPanel() {
                       {f.subject} ·{" "}
                       {new Date(f.created_at).toLocaleDateString()}
                     </span>
-                    <h3>Session {f.session_id}</h3>
+                    <h3>
+                      Session {f.session_id}
+                      {f.is_test && " · TEST"}
+                    </h3>
                   </div>
                   <span className="admin-stars">
                     <Star size={16} /> {f.rating}/5
@@ -159,62 +170,63 @@ export function AdminPanel() {
                 ))}
                 {f.notes && <p className="admin-note">{f.notes}</p>}
                 <footer>
-                  <label>
-                    Review status
-                    <select
-                      value={f.review_status}
-                      onChange={(e) =>
-                        void update(f, { status: e.target.value })
-                      }
-                    >
-                      {["new", "reviewed", "acted_upon"].map((s) => (
-                        <option key={s}>{s}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    Severity
-                    <select
-                      value={f.severity}
-                      onChange={(e) =>
-                        void update(f, { severity: e.target.value })
-                      }
-                    >
-                      {["untriaged", "low", "medium", "high"].map((s) => (
-                        <option key={s}>{s}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    Category
-                    <select
-                      value={f.issue_category}
-                      onChange={(e) =>
-                        void update(f, { category: e.target.value })
-                      }
-                    >
-                      {[
-                        "general",
-                        "clarity",
-                        "strategy_fit",
-                        "drawing_usefulness",
-                        "pacing",
-                        "grading_fairness",
-                        "workspace_connection",
-                        "context_retention",
-                        "correction_quality",
-                        "submission_clarity",
-                      ].map((s) => (
-                        <option key={s}>{s}</option>
-                      ))}
-                    </select>
-                  </label>
+                  <fieldset disabled={!canTriage} className="feedback-triage">
+                    <label>
+                      Review status
+                      <select
+                        value={f.review_status}
+                        onChange={(e) =>
+                          void update(f, { status: e.target.value })
+                        }
+                      >
+                        {["new", "reviewed", "acted_upon"].map((s) => (
+                          <option key={s}>{s}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Severity
+                      <select
+                        value={f.severity}
+                        onChange={(e) =>
+                          void update(f, { severity: e.target.value })
+                        }
+                      >
+                        {["untriaged", "low", "medium", "high"].map((s) => (
+                          <option key={s}>{s}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Category
+                      <select
+                        value={f.issue_category}
+                        onChange={(e) =>
+                          void update(f, { category: e.target.value })
+                        }
+                      >
+                        {[
+                          "general",
+                          "clarity",
+                          "strategy_fit",
+                          "drawing_usefulness",
+                          "pacing",
+                          "grading_fairness",
+                          "workspace_connection",
+                          "context_retention",
+                          "correction_quality",
+                          "submission_clarity",
+                        ].map((s) => (
+                          <option key={s}>{s}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </fieldset>
                 </footer>
               </article>
             ))}
           </section>
         ))}
-        <PrivacyQueue />
       </main>
     </div>
   );

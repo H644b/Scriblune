@@ -1,3 +1,4 @@
+import { ThemeToggle } from "@/components/theme";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { features } from "@/lib/features";
@@ -34,6 +35,7 @@ export default async function Page({
       <header className="desk-header">
         <Logo />
         <Link href="/demo">Explore the workspace</Link>
+      <ThemeToggle />
       </header>
       <main className="feature-page">
         <span className="eyebrow">{f.eyebrow}</span>

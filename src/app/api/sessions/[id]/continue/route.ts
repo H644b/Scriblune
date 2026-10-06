@@ -1,8 +1,11 @@
+import { captureFreeTier } from "@/lib/server/free-tier-guard";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { requireUser } from "@/lib/supabase/server";
 import { accountTx, ownedSession } from "@/lib/server/db";
 import { storage } from "@/lib/server/storage";
+import { reserveUsage } from "@/lib/server/usage";
+import { requirePermission } from "@/lib/server/admin";
 import { sameOrigin, json, failure, AppError } from "@/lib/server/errors";
 export async function POST(
   request: Request,
@@ -13,13 +16,20 @@ export async function POST(
     sameOrigin(request);
     const u = await requireUser(),
       id = z.uuid().parse((await c.params).id);
+    await captureFreeTier(u.id);
     const snapshot = await accountTx(u.id, async (tx) => {
       const s = await ownedSession(tx, id);
       if (s.status !== "submitted")
         throw new AppError(409, "Continue your existing draft.");
-      return (
+      const submission = (
         await tx`select snapshot from public.submissions where session_id=${id}`
-      )[0].snapshot;
+      )[0];
+      if (submission) return { ...submission.snapshot, is_test: s.is_test };
+      const test = (
+        await tx`select snapshot from private.test_completions where session_id=${id}`
+      )[0];
+      if (test) return test.snapshot;
+      throw new AppError(409, "Saved completion not found.");
     });
     const nextId = randomUUID(),
       docMap = new Map<string, string>(),
@@ -51,7 +61,9 @@ export async function POST(
       }
     }
     await accountTx(u.id, async (tx) => {
-      await tx`insert into public.tutoring_sessions(id,account_id,title) values(${nextId},${u.id},${`${snapshot.title.slice(0, 145)} · new draft`})`;
+      if (snapshot.is_test) await requirePermission(tx, u.id, "testing.tools");
+      else await reserveUsage(tx, u.id, "session", nextId);
+      await tx`insert into public.tutoring_sessions(id,account_id,title,is_test) values(${nextId},${u.id},${`${snapshot.title.slice(0, 145)} · new draft`},${!!snapshot.is_test})`;
       for (const d of snapshot.documents)
         await tx`insert into public.documents(id,session_id,name,role,mime,storage_path,byte_size,status,page_count) values(${docMap.get(d.id)!},${nextId},${d.name},${d.role},${d.mime},${`${u.id}/${nextId}/${docMap.get(d.id)}/${d.role === "scratch" ? "scratch" : "original"}`},${d.byte_size},'ready',${snapshot.pages.filter((p: any) => p.document_id === d.id).length})`;
       for (const p of snapshot.pages)

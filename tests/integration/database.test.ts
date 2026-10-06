@@ -1,11 +1,35 @@
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-const hooks = vi.hoisted(() => ({ run: null as any, user: "" }));
+const hooks = vi.hoisted(() => ({
+  run: null as any,
+  user: "",
+  toolTrace: [] as string[],
+}));
+vi.mock("../../src/lib/ai/tools", async (importOriginal) => {
+  const original = await importOriginal<any>();
+  return {
+    ...original,
+    executeTool: async (name: string, ...args: any[]) => {
+      try {
+        const result = await original.executeTool(name, ...args);
+        hooks.toolTrace.push(`${name}: succeeded`);
+        return result;
+      } catch (error) {
+        hooks.toolTrace.push(`${name}: ${(error as Error).message}`);
+        throw error;
+      }
+    },
+  };
+});
 vi.mock("../../src/lib/server/db", async (importOriginal) => ({
   ...(await importOriginal<any>()),
   accountTx: (id: string, fn: any) => hooks.run(id, fn),
+  db:
+    () =>
+    (strings: TemplateStringsArray, ...values: any[]) =>
+      hooks.run(values[0], (tx: any) => tx(strings, ...values)),
 }));
 vi.mock("../../src/lib/supabase/server", () => ({
   requireUser: async () => {
@@ -29,9 +53,30 @@ import { submitWork } from "../../src/lib/server/submit";
 import { getQuestions, saveFeedback } from "../../src/lib/server/feedback";
 import { runTutor } from "../../src/lib/ai/tutor";
 import { cancelTurn } from "../../src/lib/server/cancel";
+import {
+  reserveUsage,
+  refundPrompt,
+  usageInTx,
+} from "../../src/lib/server/usage";
+import {
+  syncSubscription,
+  handleBillingEvent,
+  stripe,
+  checkoutAllowed,
+  startCheckout,
+} from "../../src/lib/server/billing";
+import {
+  GET as billingSettingsGet,
+  PUT as billingSettingsPut,
+} from "../../src/app/api/owner/billing/settings/route";
+import { GET as ownerBillingRoute } from "../../src/app/api/owner/billing/route";
+import { POST as billingWebhook } from "../../src/app/api/billing/webhook/route";
+import { POST as createSessionRoute } from "../../src/app/api/sessions/route";
+import { POST as tutorRoute } from "../../src/app/api/sessions/[id]/chat/route";
 import { updateMemory, assembleContext } from "../../src/lib/ai/context";
 import { executeTool } from "../../src/lib/ai/tools";
 import { POST as submitRoute } from "../../src/app/api/sessions/[id]/submit/route";
+import { POST as ackRoute } from "../../src/app/api/sessions/[id]/ack/route";
 import { POST as annotationRoute } from "../../src/app/api/sessions/[id]/annotations/route";
 import { GET as adminRoute } from "../../src/app/api/admin/feedback/route";
 import {
@@ -175,14 +220,12 @@ async function reviewRecord(sessionId = S, pageId = P) {
 beforeAll(async () => {
   pg = new PGlite();
   await pg.exec(
-    `create role anon;create role authenticated;create role service_role bypassrls;create schema auth;create schema storage;create table auth.users(id uuid primary key,raw_user_meta_data jsonb default '{}');create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;grant usage on schema auth to authenticated;create table storage.buckets(id text primary key,name text,public boolean,file_size_limit bigint,allowed_mime_types text[]);`,
+    `create role anon;create role authenticated;create role service_role bypassrls;create schema auth;create schema storage;create table auth.users(id uuid primary key,email text,email_confirmed_at timestamptz,created_at timestamptz default now(),confirmation_token text default '',recovery_token text default '',reauthentication_token text default '',email_change_token_new text default '',email_change_token_current text default '',email_change text default '',email_change_confirm_status smallint default 0,phone_change_token text default '',phone_change text default '',raw_user_meta_data jsonb default '{}');create table auth.sessions(id uuid primary key,user_id uuid references auth.users(id),not_after timestamptz,refresh_token text);alter table auth.sessions enable row level security;create table auth.refresh_tokens(id uuid primary key,session_id uuid references auth.sessions(id) on delete cascade);create table auth.one_time_tokens(id uuid primary key,user_id uuid references auth.users(id) on delete cascade);create table auth.flow_state(id uuid primary key,user_id uuid,linking_target_id uuid);create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;grant usage on schema auth to authenticated;create table storage.buckets(id text primary key,name text,public boolean,file_size_limit bigint,allowed_mime_types text[]);`,
   );
-  await pg.exec(
-    readFileSync(
-      "supabase/migrations/20260930031826_scriblune_initial.sql",
-      "utf8",
-    ),
-  );
+  for (const file of readdirSync("supabase/migrations")
+    .filter((f) => f.endsWith(".sql"))
+    .sort())
+    await pg.exec(readFileSync(`supabase/migrations/${file}`, "utf8"));
   for (const id of [A, B, ADMIN]) {
     await pg.query("insert into auth.users(id) values($1)", [id]);
     await pg.query(
@@ -228,7 +271,7 @@ beforeAll(async () => {
       [id, session, doc, "3x + 6 = 18. x = 4. denominator 8", "fixture.png"],
     );
   await pg.query(
-    "insert into private.admin_memberships(account_id,role) values($1,$2)",
+    "insert into private.staff_assignments(account_id,role_key) values($1,$2)",
     [ADMIN, "reviewer"],
   );
   hooks.run = (accountId: string, fn: any) =>
@@ -245,6 +288,115 @@ afterAll(async () => {
   await pg.close();
 });
 describe("real PostgreSQL policies and authenticated services", () => {
+  it("authorizes the console in one invoker call without bypassing session or factor checks", async () => {
+    const id = randomUUID(),
+      login = randomUUID();
+    await pg.query("insert into auth.users(id) values($1)", [id]);
+    await pg.query("insert into private.site_owners(account_id) values($1)", [
+      id,
+    ]);
+    await pg.query("insert into auth.sessions(id,user_id) values($1,$2)", [
+      login,
+      id,
+    ]);
+    const check = () =>
+      asRole(
+        "scriblune_server",
+        id,
+        "select * from private.console_access($1,$2,'owner@example.com')",
+        [id, login],
+      );
+    expect((await check()).rows[0]).toEqual({
+      is_owner: true,
+      active: true,
+      verified: true,
+    });
+    await pg.query(
+      "insert into private.account_security(account_id,totp_secret,version) values($1,'encrypted',1)",
+      [id],
+    );
+    expect((await check()).rows[0]).toEqual({
+      is_owner: true,
+      active: true,
+      verified: false,
+    });
+    await pg.query(
+      "insert into private.verified_sessions(session_id,account_id,email,security_version) values($1,$2,'owner@example.com',1)",
+      [login, id],
+    );
+    expect((await check()).rows[0]).toEqual({
+      is_owner: true,
+      active: true,
+      verified: true,
+    });
+    await pg.query("delete from auth.sessions where id=$1", [login]);
+    expect((await check()).rows[0]).toEqual({
+      is_owner: true,
+      active: false,
+      verified: true,
+    });
+    await pg.query("delete from private.site_owners where account_id=$1", [id]);
+    expect((await check()).rows[0]).toEqual({
+      is_owner: false,
+      active: false,
+      verified: true,
+    });
+    for (const role of ["anon", "authenticated", "service_role"])
+      await expect(
+        asRole(
+          role,
+          id,
+          "select * from private.console_access($1,$2,'owner@example.com')",
+          [id, login],
+        ),
+      ).rejects.toThrow(/permission denied/);
+    expect(
+      (
+        await pg.query(
+          "select prosecdef from pg_proc join pg_namespace n on n.oid=pronamespace where proname='console_access' and n.nspname='private'",
+        )
+      ).rows[0],
+    ).toEqual({ prosecdef: false });
+    await pg.query("delete from auth.users where id=$1", [id]);
+  });
+  it("keeps passkeys and backup hashes private and scoped to their account", async () => {
+    await asRole(
+      "scriblune_server",
+      A,
+      "insert into private.account_passkeys(id,account_id,name,public_key,counter) values('test-key',$1,'QA','public-key',0)",
+      [A],
+    );
+    await asRole(
+      "scriblune_server",
+      A,
+      "insert into private.account_recovery_codes(account_id,code_hash) values($1,'hash')",
+      [A],
+    );
+    for (const table of ["account_passkeys", "account_recovery_codes"]) {
+      expect(
+        (await asRole("scriblune_server", B, `select * from private.${table}`))
+          .rows,
+      ).toHaveLength(0);
+      for (const role of ["anon", "authenticated", "service_role"])
+        await expect(
+          asRole(role, A, `select * from private.${table}`),
+        ).rejects.toThrow(/permission denied/);
+      await expect(
+        asRole(
+          "scriblune_server",
+          A,
+          `update private.${table} set account_id=$1 where account_id=$2`,
+          [B, A],
+        ),
+      ).rejects.toThrow(/row-level security/);
+      await asRole(
+        "scriblune_server",
+        A,
+        `delete from private.${table} where account_id=$1`,
+        [A],
+      );
+    }
+  });
   it("enables RLS for every exposed app table and restricts private schema grants", async () => {
     const rows = (
       await pg.query<{ relname: string }>(
@@ -273,8 +425,16 @@ describe("real PostgreSQL policies and authenticated services", () => {
       "submissions",
     ]) {
       const clause = table === "tutoring_sessions" ? "id" : "session_id";
+      await expect(
+        asRole(
+          "authenticated",
+          B,
+          `select * from public.${table} where ${clause}=$1`,
+          [S],
+        ),
+      ).rejects.toThrow("permission");
       const result = await asRole(
-        "authenticated",
+        "scriblune_server",
         B,
         `select * from public.${table} where ${clause}=$1`,
         [S],
@@ -572,6 +732,154 @@ describe("real PostgreSQL policies and authenticated services", () => {
       turn,
     ]);
   });
+  it("rewrites tutor steps atomically, protects student ink, and preserves acknowledged erasures on stop", async () => {
+    const turnId = randomUUID(),
+      state = (await getWorkspace(A, S)).session;
+    await pg.query(
+      "insert into public.tutor_turns(id,session_id,status,base_scene_revision,base_work_revision) values($1,$2,'running',$3,$4)",
+      [turnId, S, state.scene_revision, state.work_revision],
+    );
+    const events: any[] = [];
+    const c = {
+      accountId: A,
+      sessionId: S,
+      turnId,
+      groupId: randomUUID(),
+      emit: (event: unknown) => events.push(event),
+    };
+    const created = await executeTool(
+      "create_tutor_page",
+      { title: "MVT explanation" },
+      c,
+    );
+    const pageId = (created.result as any).page_id;
+    expect(events[0].page.id).toBe(pageId);
+    const args = {
+      page_id: pageId,
+      region: { x: 45, y: 45, width: 900, height: 1000 },
+      replace_object_ids: [],
+      heading: "Original explanation",
+      steps: [
+        {
+          explanation: "Find the average slope.",
+          math: "(6 − 0) / (1 − 0) = 6",
+        },
+      ],
+    };
+    const first = await executeTool("write_worked_steps", args, c);
+    const oldIds = (first.result as any).object_ids;
+    const illustration = await executeTool(
+      "draw_number_line",
+      {
+        page_id: pageId,
+        region: { x: 45, y: 1000, width: 900, height: 240 },
+        minimum: 0,
+        maximum: 3,
+        ticks: [0, 1, 3],
+        intervals: [
+          {
+            start: 0,
+            end: 1,
+            label: "First open interval",
+            color: "#3454b4",
+            open_start: true,
+            open_end: true,
+          },
+          {
+            start: 1,
+            end: 3,
+            label: "Second open interval",
+            color: "#b16e50",
+            open_start: true,
+            open_end: true,
+          },
+        ],
+        replace_object_ids: [],
+      },
+      c,
+    );
+    const diagramIds = (illustration.result as any).object_ids;
+    await expect(
+      executeTool(
+        "write_worked_steps",
+        { ...args, replace_object_ids: [...oldIds, ...diagramIds] },
+        c,
+      ),
+    ).rejects.toThrow("cannot erase diagrams");
+    await expect(
+      executeTool("write_worked_steps", { ...args, heading: "Overlapping" }, c),
+    ).rejects.toThrow("overlap");
+    await expect(
+      executeTool(
+        "write_worked_steps",
+        {
+          ...args,
+          replace_object_ids: oldIds,
+          region: { x: 45, y: 45, width: 100, height: 30 },
+        },
+        c,
+      ),
+    ).rejects.toThrow("does not fit");
+    expect(
+      (await getWorkspace(A, S)).objects.filter((o) => oldIds.includes(o.id)),
+    ).toHaveLength(oldIds.length);
+    const student = (await getWorkspace(A, S)).objects.find(
+      (o) => o.actor === "student",
+    )!;
+    await expect(
+      executeTool(
+        "write_worked_steps",
+        { ...args, page_id: student.page_id, replace_object_ids: [student.id] },
+        c,
+      ),
+    ).rejects.toThrow("Student work is protected");
+    const second = await executeTool(
+      "write_worked_steps",
+      {
+        ...args,
+        replace_object_ids: oldIds,
+        heading: "Clearer explanation",
+        steps: [
+          {
+            explanation:
+              "Use two disjoint intervals to guarantee different points.",
+            math: "(6 − 0) / (1 − 0) = 6; (18 − 6) / (3 − 1) = 6",
+          },
+        ],
+      },
+      c,
+    );
+    const newIds = (second.result as any).object_ids;
+    const after = await getWorkspace(A, S);
+    expect(after.objects.some((o) => oldIds.includes(o.id))).toBe(false);
+    expect(after.objects.filter((o) => newIds.includes(o.id))).toHaveLength(
+      newIds.length,
+    );
+    const firstNewAction = events.find(
+      (e) => e.type === "action" && e.action.object_id === newIds[0],
+    ).action;
+    hooks.user = A;
+    const ack = await ackRoute(
+      new Request("http://localhost:3000/api/ack", {
+        method: "POST",
+        headers: { origin: "http://localhost:3000" },
+        body: JSON.stringify({
+          turn_id: turnId,
+          action_id: firstNewAction.action_id,
+        }),
+      }),
+      { params: Promise.resolve({ id: S }) },
+    );
+    expect(ack.status).toBe(200);
+    hooks.user = "";
+    await cancelTurn(A, S, turnId);
+    const stopped = await getWorkspace(A, S);
+    expect(stopped.objects.some((o) => oldIds.includes(o.id))).toBe(false);
+    expect(
+      stopped.objects.filter((o) => newIds.includes(o.id)).map((o) => o.id),
+    ).toEqual([newIds[0]]);
+    expect(stopped.objects.find((o) => o.id === student.id)).toEqual(student);
+  });
   it.runIf(process.env.RUN_LIVE_AI === "1")(
     "live model grounds a denominator circle and draws an arbitrary path and labeled graph",
     async () => {
@@ -665,6 +973,128 @@ describe("real PostgreSQL policies and authenticated services", () => {
           (o) => o.geometry.kind === "text" && /x/.test(o.geometry.text),
         ),
       ).toBe(true);
+    },
+    360000,
+  );
+  it.runIf(process.env.RUN_LIVE_AI === "1")(
+    "live model writes MVT reasoning and an illustration, then replaces its writing",
+    async () => {
+      const session = randomUUID(),
+        doc = randomUUID(),
+        page = randomUUID();
+      await pg.query(
+        "insert into public.tutoring_sessions(id,account_id,title) values($1,$2,'MVT instruction evaluation')",
+        [session, A],
+      );
+      await pg.query(
+        "insert into public.documents(id,session_id,name,role,mime,storage_path,byte_size,status,page_count) values($1,$2,'MVT table','assignment','application/x-scriblune-scratch',$3,0,'ready',1)",
+        [doc, session, randomUUID()],
+      );
+      await pg.query(
+        "insert into public.document_pages(id,session_id,document_id,page_number,width,height,original_width,original_height,text_content,extraction_method) values($1,$2,$3,1,1000,1294,1000,1294,$4,'scratch')",
+        [
+          page,
+          session,
+          doc,
+          "A differentiable function f has f(0)=0, f(1)=6, f(3)=18, f(5)=26. How many distinct times in (0,5) are guaranteed to have f′(t)=6?",
+        ],
+      );
+      const run = async (message: string, pageId = page) => {
+        const turnId = randomUUID(),
+          s = (await getWorkspace(A, session)).session;
+        await pg.query(
+          "insert into public.tutor_turns(id,session_id,status,base_scene_revision,base_work_revision) values($1,$2,'running',$3,$4)",
+          [turnId, session, s.scene_revision, s.work_revision],
+        );
+        await pg.query(
+          "insert into public.messages(session_id,turn_id,role,content) values($1,$2,'student',$3)",
+          [session, turnId, message],
+        );
+        const events: any[] = [];
+        let failure = "";
+        hooks.toolTrace = [];
+        await runTutor({
+          accountId: A,
+          sessionId: session,
+          turnId,
+          pageId,
+          message,
+          selection: null,
+          selectedIds: [],
+          emit: (e) => events.push(e),
+          signal: AbortSignal.timeout(170000),
+          onFailure: (error) => {
+            const e = error as Error;
+            failure = `${e.name}: ${e.message.replaceAll(process.env.OPENAI_API_KEY || "__none__", "[redacted]")}`;
+          },
+        });
+        expect(
+          events.filter((e) => e.type === "error"),
+          failure + "\n" + hooks.toolTrace.join("\n"),
+        ).toEqual([]);
+        return { state: await getWorkspace(A, session), events };
+      };
+      const first = await run(
+        "Yes explain to me step by step write it out and help me understand how to solve it.",
+      );
+      const words = first.state.objects.filter((o) =>
+        ["text", "math"].includes(o.geometry.kind),
+      );
+      expect(words.length).toBeGreaterThanOrEqual(3);
+      const allText = words.map((o) => o.geometry.text).join(" ");
+      expect(allText).toMatch(/6/);
+      expect(allText, hooks.toolTrace.join("\n")).toMatch(/2|two|twice/i);
+      expect(
+        first.state.objects.some((o) =>
+          ["path", "line", "arrow", "ellipse", "rect", "graph"].includes(
+            o.geometry.kind,
+          ),
+        ),
+      ).toBe(true);
+      const second = await run(
+        "Improve your writing: rewrite your explanation in fewer, clearer steps and replace your old written explanation. Keep the interval illustration.",
+        words[0].page_id,
+      );
+      const deleted = second.events
+        .filter((e) => e.type === "action" && !e.action.after)
+        .map((e) => e.action.object_id);
+      expect(words.some((o) => deleted.includes(o.id))).toBe(true);
+      const diagram = first.state.objects.filter(
+        (o) => o.group || !["text", "math"].includes(o.geometry.kind),
+      );
+      expect(diagram.length).toBeGreaterThan(0);
+      expect(
+        diagram.every((o) =>
+          second.state.objects.some((after) => after.id === o.id),
+        ),
+      ).toBe(true);
+      expect(second.state.objects.some((o) => deleted.includes(o.id))).toBe(
+        false,
+      );
+      expect(
+        second.events.some(
+          (e) =>
+            e.type === "action" &&
+            e.action.after &&
+            ["text", "math"].includes(e.action.after.geometry.kind),
+        ),
+      ).toBe(true);
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      const { renderPage } = await import("../../src/lib/server/render");
+      mkdirSync("artifacts", { recursive: true });
+      for (const [label, state] of [
+        ["original", first.state],
+        ["rewritten", second.state],
+      ] as const) {
+        const p = state.pages.find((p) => p.id === words[0].page_id)!;
+        writeFileSync(
+          `artifacts/mvt-${label}.png`,
+          await renderPage(
+            p as any,
+            state.objects.filter((o) => o.page_id === p.id),
+          ),
+        );
+      }
     },
     360000,
   );
@@ -793,7 +1223,11 @@ describe("real PostgreSQL policies and authenticated services", () => {
         )
       ).rows,
     ).toHaveLength(1);
-    expect(await getQuestions(A, S)).toEqual({ received: true, questions: [] });
+    expect(await getQuestions(A, S)).toEqual({
+      received: true,
+      questions: [],
+      is_test: false,
+    });
     const w = await getWorkspace(A, S);
     expect(JSON.stringify(w)).not.toContain("The drawing was too quick.");
   });
@@ -855,7 +1289,7 @@ describe("real PostgreSQL policies and authenticated services", () => {
     hooks.user = ADMIN;
     expect((await GET()).status).toBe(403);
     await pg.query(
-      "update private.admin_memberships set role=$1 where account_id=$2",
+      "update private.staff_assignments set role_key=$1 where account_id=$2",
       ["admin", ADMIN],
     );
     expect((await GET()).status).toBe(200);
@@ -881,5 +1315,1053 @@ describe("real PostgreSQL policies and authenticated services", () => {
         )
       ).rows[0].status,
     ).toBe("verified");
+  });
+});
+
+describe("staff, community, and isolated testing", () => {
+  const OWNER = randomUUID(),
+    MOD = randomUUID(),
+    TESTER = randomUUID(),
+    MEMBER = randomUUID(),
+    NO_NAME = randomUUID();
+  let category: string, threadId: string, postId: string, replyId: string;
+  beforeAll(async () => {
+    for (const [id, name] of [
+      [OWNER, "owner_test"],
+      [MOD, "moderator_test"],
+      [TESTER, "tester_test"],
+      [MEMBER, "member_test"],
+      [NO_NAME, null],
+    ]) {
+      await pg.query("insert into auth.users(id) values($1)", [id]);
+      await pg.query("insert into public.profiles(id) values($1)", [id]);
+      await pg.query(
+        "insert into private.community_profiles(account_id,username) values($1,$2)",
+        [id, name],
+      );
+    }
+    await pg.query("insert into private.site_owners(account_id) values($1)", [
+      OWNER,
+    ]);
+    await pg.query(
+      "insert into private.staff_assignments(account_id,role_key) values($1,'moderator'),($2,'tester')",
+      [MOD, TESTER],
+    );
+    category = (
+      await pg.query<any>(
+        "select id from private.forum_categories order by position limit 1",
+      )
+    ).rows[0].id;
+  });
+  it("keeps owner grants and role edits out of members' hands; resolves permissions immediately", async () => {
+    const { staffAccess, requirePermission } =
+      await import("../../src/lib/server/admin");
+    expect(
+      (await hooks.run(OWNER, (tx: any) => staffAccess(tx, OWNER))).owner,
+    ).toBe(true);
+    await expect(
+      hooks.run(TESTER, (tx: any) =>
+        requirePermission(tx, TESTER, "feedback.read"),
+      ),
+    ).rejects.toThrow();
+    await expect(
+      hooks.run(MOD, (tx: any) => requirePermission(tx, MOD, "privacy.manage")),
+    ).rejects.toThrow();
+    await expect(
+      asRole(
+        "scriblune_server",
+        MEMBER,
+        "insert into private.site_owners(account_id) values($1)",
+        [MEMBER],
+      ),
+    ).rejects.toThrow();
+    await expect(
+      asRole(
+        "scriblune_server",
+        OWNER,
+        "delete from private.site_owners where account_id=$1",
+        [OWNER],
+      ),
+    ).rejects.toThrow();
+    await expect(
+      asRole(
+        "scriblune_server",
+        MEMBER,
+        "insert into private.staff_assignments(account_id,role_key) values($1,'admin')",
+        [MEMBER],
+      ),
+    ).rejects.toThrow();
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          MEMBER,
+          "update private.staff_roles set permissions=array['privacy.manage'] where key='tester' returning key",
+        )
+      ).rows,
+    ).toHaveLength(0);
+    await asRole(
+      "scriblune_server",
+      OWNER,
+      "insert into private.staff_roles(key,name,permissions) values('helper','Helper',array['feedback.read'])",
+    );
+    await asRole(
+      "scriblune_server",
+      OWNER,
+      "insert into private.staff_assignments(account_id,role_key) values($1,'helper')",
+      [MEMBER],
+    );
+    expect(
+      (await hooks.run(MEMBER, (tx: any) => staffAccess(tx, MEMBER)))
+        .permissions,
+    ).toContain("feedback.read");
+    await asRole(
+      "scriblune_server",
+      OWNER,
+      "delete from private.staff_assignments where account_id=$1",
+      [MEMBER],
+    );
+    expect(
+      (await hooks.run(MEMBER, (tx: any) => staffAccess(tx, MEMBER))).staff,
+    ).toBe(false);
+    await expect(
+      asRole(
+        "authenticated",
+        MEMBER,
+        "select * from private.staff_assignments",
+      ),
+    ).rejects.toThrow();
+  });
+  it("limits console session checks to the protected owner's own active login, with no token access", async () => {
+    // Mirror hosted Supabase's namespace ownership; the invoker view still uses RLS.
+    await pg.exec("revoke usage on schema auth from scriblune_server");
+    const { assertConsoleOwner } =
+      await import("../../src/lib/server/console-auth");
+    const active = randomUUID(),
+      other = randomUUID(),
+      expired = randomUUID();
+    await pg.query(
+      "insert into auth.sessions(id,user_id) values($1,$2),($3,$4)",
+      [active, OWNER, other, MOD],
+    );
+    await pg.query(
+      "insert into auth.sessions(id,user_id,not_after) values($1,$2,now()-interval '1 minute')",
+      [expired, OWNER],
+    );
+    await expect(
+      assertConsoleOwner({ accountId: OWNER, loginId: active }),
+    ).resolves.toBeUndefined();
+    await expect(
+      assertConsoleOwner({ accountId: OWNER, loginId: other }),
+    ).rejects.toThrow("login has ended");
+    await expect(
+      assertConsoleOwner({ accountId: MOD, loginId: other }),
+    ).rejects.toThrow("Only the site Owner");
+    await expect(
+      assertConsoleOwner({ accountId: OWNER, loginId: expired }),
+    ).rejects.toThrow("login has ended");
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          MOD,
+          "select id from private.owner_login_sessions",
+        )
+      ).rows,
+    ).toHaveLength(0);
+    await expect(
+      asRole(
+        "scriblune_server",
+        OWNER,
+        "select refresh_token from auth.sessions",
+      ),
+    ).rejects.toThrow();
+    await expect(
+      asRole("authenticated", OWNER, "select id from auth.sessions"),
+    ).rejects.toThrow();
+    await pg.query("delete from auth.sessions where id=$1", [active]);
+    await expect(
+      assertConsoleOwner({ accountId: OWNER, loginId: active }),
+    ).rejects.toThrow("login has ended");
+  });
+  it("requires usernames, creates Markdown threads, and publishes only opted-in badges", async () => {
+    const { forumMutate, forumList, forumDiscussion, GUEST } =
+      await import("../../src/lib/server/forum");
+    const input = {
+      action: "thread" as const,
+      category_id: category,
+      title: "An algebra discussion",
+      body: "**How** does the first step work?",
+      show_badge: true,
+      attachments: [],
+    };
+    await expect(forumMutate(NO_NAME, input)).rejects.toThrow(/username/);
+    const r = await forumMutate(MOD, input);
+    threadId = r.thread_id!;
+    postId = r.post_id!;
+    const d = await forumDiscussion(GUEST, threadId, 1);
+    expect(d.posts[0].author.badge).toBe("mod");
+    expect(d.posts[0].author.username).toBe("moderator_test");
+    expect(JSON.stringify(d)).not.toContain(MOD);
+    expect(d.viewer.signedIn).toBe(false);
+    const reply = await forumMutate(TESTER, {
+      action: "reply",
+      thread_id: threadId,
+      reply_to: postId,
+      body: "A **test** reply",
+      show_badge: false,
+      attachments: [],
+    });
+    replyId = reply.post_id!;
+    expect(
+      (await forumDiscussion(GUEST, threadId, 1)).posts[1].author.badge,
+    ).toBe(null);
+    const list = await forumList(GUEST, {
+      q: "algebra",
+      category: null,
+      sort: "active",
+      page: 1,
+      bookmarked: false,
+      removed: false,
+    });
+    expect(list.threads[0].replies).toBe(1);
+    expect(list.more).toBe(false);
+  });
+  it("enforces authorship, moderator controls, edit revisions, and immutable identities", async () => {
+    const { forumMutate, forumDiscussion } =
+      await import("../../src/lib/server/forum");
+    await expect(
+      forumMutate(MEMBER, {
+        action: "edit",
+        post_id: replyId,
+        revision: 1,
+        body: "Hijacked",
+        show_badge: true,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      asRole(
+        "scriblune_server",
+        MEMBER,
+        "update private.forum_threads set pinned=true where id=$1",
+        [threadId],
+      ),
+    ).rejects.toThrow();
+    await expect(
+      asRole(
+        "scriblune_server",
+        MEMBER,
+        "update private.forum_threads set title='Hijacked title' where id=$1",
+        [threadId],
+      ),
+    ).rejects.toThrow();
+    await expect(
+      asRole(
+        "scriblune_server",
+        MOD,
+        "update private.forum_posts set author_id=$1 where id=$2",
+        [MOD, replyId],
+      ),
+    ).rejects.toThrow();
+    await forumMutate(MOD, {
+      action: "edit",
+      post_id: replyId,
+      revision: 1,
+      body: "Moderator correction",
+      show_badge: true,
+    });
+    await expect(
+      forumMutate(TESTER, {
+        action: "edit",
+        post_id: replyId,
+        revision: 1,
+        body: "Stale overwrite",
+        show_badge: true,
+      }),
+    ).rejects.toThrow(/changed/);
+    const p = (await forumDiscussion(MEMBER, threadId, 1)).posts[1];
+    expect(p.author.badge).toBe(null); // Moderators cannot force another author's badge on.
+    expect(p.body).toBe("Moderator correction");
+    await forumMutate(MOD, {
+      action: "moderate_thread",
+      thread_id: threadId,
+      category_id: category,
+      locked: true,
+      pinned: true,
+    });
+    await expect(
+      forumMutate(TESTER, {
+        action: "reply",
+        thread_id: threadId,
+        reply_to: null,
+        body: "Locked reply",
+        show_badge: false,
+        attachments: [],
+      }),
+    ).rejects.toThrow(/closed/);
+    await forumMutate(MOD, {
+      action: "moderate_thread",
+      thread_id: threadId,
+      category_id: category,
+      locked: false,
+      pinned: false,
+    });
+  });
+  it("supports reactions, bookmarks and confidential report queues", async () => {
+    const { forumMutate, forumDiscussion, moderationQueue } =
+      await import("../../src/lib/server/forum");
+    await forumMutate(MEMBER, {
+      action: "react",
+      post_id: postId,
+      active: true,
+    });
+    await forumMutate(MEMBER, {
+      action: "react",
+      post_id: postId,
+      active: true,
+    });
+    await forumMutate(MEMBER, {
+      action: "bookmark",
+      thread_id: threadId,
+      active: true,
+    });
+    await forumMutate(MEMBER, {
+      action: "report",
+      post_id: postId,
+      reason: "Please review this explanation",
+    });
+    const d = await forumDiscussion(MEMBER, threadId, 1);
+    expect(d.posts[0].likes).toBe(1);
+    expect(d.thread.bookmarked).toBe(true);
+    await expect(moderationQueue(TESTER)).rejects.toThrow();
+    const reports = (await moderationQueue(MOD)).reports;
+    expect(reports[0].reason).toContain("review");
+    await forumMutate(MOD, {
+      action: "resolve_report",
+      report_id: reports[0].id,
+      status: "resolved",
+      resolution: "Reviewed and clarified",
+    });
+    expect((await moderationQueue(MOD)).reports[0].status).toBe("resolved");
+  });
+  it("checks attachment ownership and hides removed posts and their files from the public", async () => {
+    const { forumMutate, forumDiscussion, GUEST } =
+      await import("../../src/lib/server/forum");
+    const attachment = randomUUID(),
+      foreign = randomUUID();
+    for (const [id, owner] of [
+      [attachment, MEMBER],
+      [foreign, TESTER],
+    ])
+      await pg.query(
+        "insert into private.forum_attachments(id,owner_id,path,name,mime,bytes) values($1,$2,$3,'example.webp','image/webp',100)",
+        [id, owner, `attachment/${id}`],
+      );
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          GUEST,
+          "select id from private.forum_attachments where id=$1",
+          [attachment],
+        )
+      ).rows,
+    ).toHaveLength(0);
+    await expect(
+      forumMutate(MEMBER, {
+        action: "reply",
+        thread_id: threadId,
+        reply_to: null,
+        body: "Bad attachment",
+        show_badge: false,
+        attachments: [foreign],
+      }),
+    ).rejects.toThrow(/attachment/);
+    const r = await forumMutate(MEMBER, {
+      action: "reply",
+      thread_id: threadId,
+      reply_to: null,
+      body: "My image",
+      show_badge: false,
+      attachments: [attachment],
+    });
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          GUEST,
+          "select id from private.forum_attachments where id=$1",
+          [attachment],
+        )
+      ).rows,
+    ).toHaveLength(1);
+    await forumMutate(MEMBER, { action: "delete", post_id: r.post_id! });
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          GUEST,
+          "select id from private.forum_attachments where id=$1",
+          [attachment],
+        )
+      ).rows,
+    ).toHaveLength(0);
+    expect(
+      (await forumDiscussion(GUEST, threadId, 1)).posts.find(
+        (p) => p.id === r.post_id,
+      )?.body,
+    ).toBe("");
+    await expect(
+      forumMutate(MEMBER, { action: "restore", post_id: r.post_id! }),
+    ).rejects.toThrow();
+    await forumMutate(MOD, { action: "restore", post_id: r.post_id! });
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          GUEST,
+          "select id from private.forum_attachments where id=$1",
+          [attachment],
+        )
+      ).rows,
+    ).toHaveLength(1);
+  });
+  it("makes bans forum-only and lets moderators remove and restore entire discussions", async () => {
+    const { forumMutate, forumDiscussion, GUEST } =
+      await import("../../src/lib/server/forum");
+    await forumMutate(MOD, {
+      action: "ban",
+      username: "member_test",
+      reason: "Community test suspension",
+      days: 7,
+    });
+    await expect(
+      forumMutate(MEMBER, { action: "react", post_id: postId, active: true }),
+    ).rejects.toThrow(/suspended/);
+    expect(
+      (await forumDiscussion(MEMBER, threadId, 1)).viewer.ban?.reason,
+    ).toContain("suspension");
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          MEMBER,
+          "insert into public.tutoring_sessions(account_id,title) values($1,'Study during forum suspension') returning id",
+          [MEMBER],
+        )
+      ).rows,
+    ).toHaveLength(1);
+    await expect(
+      forumMutate(MOD, {
+        action: "ban",
+        username: "owner_test",
+        reason: "Not allowed",
+        days: 0,
+      }),
+    ).rejects.toThrow();
+    await forumMutate(MOD, { action: "unban", account_id: MEMBER });
+    await forumMutate(MOD, { action: "delete", post_id: postId });
+    await expect(forumDiscussion(GUEST, threadId, 1)).rejects.toThrow(
+      /not found/,
+    );
+    await forumMutate(MOD, { action: "restore", post_id: postId });
+    expect((await forumDiscussion(GUEST, threadId, 1)).posts[0].body).toContain(
+      "How",
+    );
+    const own = await forumMutate(MEMBER, {
+      action: "thread",
+      category_id: category,
+      title: "Delete my own thread",
+      body: "This is a test",
+      show_badge: false,
+      attachments: [],
+    });
+    await forumMutate(MEMBER, { action: "delete", post_id: own.post_id! });
+    await expect(forumDiscussion(GUEST, own.thread_id!, 1)).rejects.toThrow();
+  });
+  it("opens a specific reply on the correct page of a long discussion", async () => {
+    const { forumDiscussion, GUEST } =
+      await import("../../src/lib/server/forum");
+    let target = "";
+    for (let i = 0; i < 35; i++) {
+      target = randomUUID();
+      await pg.query(
+        "insert into private.forum_posts(id,thread_id,author_id,body,created_at) values($1,$2,$3,$4,now()+$5*interval '1 second')",
+        [target, threadId, MEMBER, `Pagination reply ${i}`, i],
+      );
+    }
+    const d = await forumDiscussion(GUEST, threadId, 1, target);
+    expect(d.page).toBe(2);
+    expect(d.posts.some((p) => p.id === target)).toBe(true);
+    await expect(
+      forumDiscussion(GUEST, threadId, 1, randomUUID()),
+    ).rejects.toThrow(/not found/);
+  });
+  it("allows tester shortcuts only on owned sessions, records no fake review, and isolates test ratings", async () => {
+    const { createTestSession, completeTestSession } =
+      await import("../../src/lib/server/testing");
+    await expect(createTestSession(MEMBER, "blank")).rejects.toThrow();
+    const s = await createTestSession(TESTER, "algebra");
+    expect(
+      (await getWorkspace(TESTER, s.id)).objects[0].geometry.text,
+    ).toContain("TEST FIXTURE");
+    await expect(completeTestSession(OWNER, s.id)).rejects.toThrow(/not found/);
+    const result = await completeTestSession(TESTER, s.id);
+    expect((await completeTestSession(TESTER, s.id)).id).toBe(result.id);
+    expect(
+      (
+        await pg.query("select * from public.submissions where session_id=$1", [
+          s.id,
+        ])
+      ).rows,
+    ).toHaveLength(0);
+    expect(
+      (
+        await pg.query(
+          "select * from public.grading_reviews where session_id=$1",
+          [s.id],
+        )
+      ).rows,
+    ).toHaveLength(0);
+    const set = await getQuestions(TESTER, s.id);
+    expect(set.is_test).toBe(true);
+    expect(
+      set.questions.every((q: any) => q.related_event_ids.includes(result.id)),
+    ).toBe(true);
+    await saveFeedback(TESTER, s.id, {
+      rating: 2,
+      answers: [],
+      notes: "Synthetic tester feedback",
+    });
+    hooks.user = OWNER;
+    const regular = await (
+      await adminRoute(new Request("http://localhost:3000/api/admin/feedback"))
+    ).json();
+    expect(
+      regular.feedback.some(
+        (f: any) => f.notes === "Synthetic tester feedback",
+      ),
+    ).toBe(false);
+    const test = await (
+      await adminRoute(
+        new Request("http://localhost:3000/api/admin/feedback?test=test"),
+      )
+    ).json();
+    expect(test.feedback[0].is_test).toBe(true);
+    await pg.query(
+      "delete from private.staff_assignments where account_id=$1",
+      [TESTER],
+    );
+    await expect(createTestSession(TESTER, "blank")).rejects.toThrow();
+    expect((await getQuestions(TESTER, s.id)).received).toBe(true);
+  });
+});
+
+describe("Billing allowances and protected entitlements", () => {
+  it("session creation retries reuse the same saved session without spending twice", async () => {
+    const id = await member(),
+      requestId = randomUUID();
+    hooks.user = id;
+    const send = (key: string) =>
+      createSessionRoute(
+        new Request("http://localhost:3000/api/sessions", {
+          method: "POST",
+          headers: { Origin: "http://localhost:3000" },
+          body: JSON.stringify({ title: "A quota fixture", request_id: key }),
+        }),
+      );
+    const first = await send(requestId),
+      second = await send(requestId);
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(await first.json()).toEqual(await second.json());
+    expect((await send(randomUUID())).status).toBe(429);
+    expect((await usage(id)).sessions.used).toBe(1);
+  });
+  it("the real chat endpoint rejects a sixth free prompt before saving it or contacting AI", async () => {
+    const id = await member(),
+      session = randomUUID(),
+      doc = randomUUID(),
+      page = randomUUID();
+    hooks.user = id;
+    await pg.query("insert into public.profiles(id) values($1)", [id]);
+    await pg.query(
+      "insert into public.tutoring_sessions(id,account_id,title) values($1,$2,'Quota fixture')",
+      [session, id],
+    );
+    await pg.query(
+      "insert into public.documents(id,session_id,name,role,mime,storage_path,byte_size,status,page_count) values($1,$2,'Scratch','scratch','application/x-scriblune-scratch','quota-fixture',0,'ready',1)",
+      [doc, session],
+    );
+    await pg.query(
+      "insert into public.document_pages(id,session_id,document_id,page_number,width,height,original_width,original_height,extraction_method) values($1,$2,$3,1,1000,1294,1000,1294,'scratch')",
+      [page, session, doc],
+    );
+    for (let i = 0; i < 5; i++) await consume(id, "prompt");
+    vi.stubEnv("OPENAI_API_KEY", "test-unreachable");
+    vi.stubEnv("AI_TUTOR_MODEL", "fixture");
+    try {
+      const response = await tutorRoute(
+        new Request("http://localhost:3000/api/chat", {
+          method: "POST",
+          headers: { Origin: "http://localhost:3000" },
+          body: JSON.stringify({
+            turn_id: randomUUID(),
+            page_id: page,
+            message: "This must not be sent to AI",
+            selection: null,
+            selected_ids: [],
+          }),
+        }),
+        { params: Promise.resolve({ id: session }) },
+      );
+      expect(response.status).toBe(429);
+      expect((await response.json()).code).toBe("CREDIT_LIMIT");
+      expect(
+        (
+          await pg.query(
+            "select * from public.tutor_turns where session_id=$1",
+            [session],
+          )
+        ).rows,
+      ).toHaveLength(0);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  async function member() {
+    const id = randomUUID();
+    await pg.query("insert into auth.users(id) values($1)", [id]);
+    return id;
+  }
+  const usage = (id: string) => hooks.run(id, (tx: any) => usageInTx(tx, id));
+  const consume = (
+    id: string,
+    kind: "session" | "prompt",
+    ref = randomUUID(),
+  ) => hooks.run(id, (tx: any) => reserveUsage(tx, id, kind, ref));
+  it("enforces Free across simultaneous requests, deduplicates prompts, and refunds exactly once", async () => {
+    const id = await member(),
+      turn = randomUUID();
+    await consume(id, "session");
+    await expect(consume(id, "session")).rejects.toThrow(
+      /today’s new tutoring sessions/,
+    );
+    await consume(id, "prompt", turn);
+    await consume(id, "prompt", turn);
+    const results = await Promise.allSettled(
+      Array.from({ length: 7 }, () => consume(id, "prompt")),
+    );
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(4);
+    expect((await usage(id)).credits.available).toBe(0);
+    await hooks.run(id, (tx: any) => refundPrompt(tx, id, turn));
+    await hooks.run(id, (tx: any) => refundPrompt(tx, id, turn));
+    expect((await usage(id)).credits.available).toBe(1);
+  });
+  it("uses included credits first, carries bonus credits over UTC boundaries, and refunds bonus debits", async () => {
+    const id = await member();
+    await usage(id);
+    await pg.query(
+      "update private.billing_accounts set bonus_credits=3 where account_id=$1",
+      [id],
+    );
+    for (let i = 0; i < 5; i++) await consume(id, "prompt");
+    const turn = randomUUID();
+    await consume(id, "prompt", turn);
+    expect((await usage(id)).credits).toEqual({
+      included: 0,
+      bonus: 2,
+      available: 2,
+    });
+    await hooks.run(id, (tx: any) => refundPrompt(tx, id, turn));
+    expect((await usage(id)).credits.bonus).toBe(3);
+    await consume(id, "prompt");
+    await pg.query(
+      "update private.usage_ledger set day=(now() at time zone 'UTC')::date-1 where account_id=$1",
+      [id],
+    );
+    const next = await usage(id);
+    expect(next.credits).toEqual({ included: 5, bonus: 2, available: 7 });
+    expect(new Date(next.resetsAt).getUTCHours()).toBe(0);
+  });
+  it("falls back after grant/subscription expiry and retains today's usage across upgrades", async () => {
+    const id = await member();
+    await consume(id, "session");
+    await consume(id, "prompt");
+    await pg.query(
+      "insert into private.billing_grants(account_id,plan) values($1,'focus')",
+      [id],
+    );
+    expect(await usage(id)).toMatchObject({
+      source: "owner",
+      credits: { included: 19 },
+      sessions: { remaining: 5 },
+    });
+    await pg.query(
+      "update private.billing_grants set expires_at=now()-interval '1 second' where account_id=$1",
+      [id],
+    );
+    expect((await usage(id)).plan.key).toBe("free");
+    await pg.query(
+      "update private.billing_accounts set subscription_id='sub_fixture',subscription_plan='plus',subscription_status='active',paid_until=now()+interval '30 days',cancel_at_period_end=true where account_id=$1",
+      [id],
+    );
+    expect((await usage(id)).plan.key).toBe("plus");
+    await pg.query(
+      "update private.billing_accounts set paid_until=now()-interval '1 second' where account_id=$1",
+      [id],
+    );
+    expect((await usage(id)).plan.key).toBe("free");
+    await pg.query(
+      "update private.billing_accounts set subscription_status='past_due',paid_until=now()+interval '30 days' where account_id=$1",
+      [id],
+    );
+    expect((await usage(id)).plan.key).toBe("free");
+  });
+  it("blocks browser access, cross-account reads, non-Owner grants, and non-Owner staff billing tools", async () => {
+    const id = await member(),
+      other = await member();
+    await usage(id);
+    await usage(other);
+    for (const table of [
+      "billing_accounts",
+      "billing_grants",
+      "usage_ledger",
+      "billing_events",
+      "billing_grant_requests",
+      "billing_settings",
+    ]) {
+      for (const role of ["anon", "authenticated"]) {
+        await expect(
+          asRole(role, id, `select * from private.${table}`),
+        ).rejects.toThrow();
+      }
+    }
+    expect(
+      (
+        await asRole(
+          "scriblune_server",
+          id,
+          "select * from private.billing_accounts where account_id=$1",
+          [other],
+        )
+      ).rows,
+    ).toHaveLength(0);
+    await expect(
+      asRole(
+        "scriblune_server",
+        id,
+        "insert into private.billing_grants(account_id,plan,granted_by) values($1,'focus',$1)",
+        [id],
+      ),
+    ).rejects.toThrow(/row-level security/);
+    hooks.user = id;
+    expect(
+      (
+        await ownerBillingRoute(
+          new Request(
+            "http://localhost:3000/api/owner/billing?email=any@example.com",
+          ),
+        )
+      ).status,
+    ).toBe(403);
+    hooks.user = ADMIN;
+    expect(
+      (
+        await ownerBillingRoute(
+          new Request(
+            "http://localhost:3000/api/owner/billing?email=any@example.com",
+          ),
+        )
+      ).status,
+    ).toBe(403);
+  });
+  it("Owner checkout access enforces Off, Staff only, and Customers independently of Stripe key mode", async () => {
+    const id = await member(),
+      owner = await member(),
+      staff = await member();
+    await pg.query("insert into private.site_owners(account_id) values($1)", [
+      owner,
+    ]);
+    await pg.query(
+      "insert into private.staff_assignments(account_id,role_key) values($1,'moderator')",
+      [staff],
+    );
+    for (const [key, value] of Object.entries({
+      STRIPE_SECRET_KEY: "sk_test_fixture",
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: "pk_test_fixture",
+      STRIPE_WEBHOOK_SECRET: "whsec_fixture",
+      STRIPE_PRODUCT_ID: "prod_fixture",
+      STRIPE_PORTAL_CONFIGURATION_ID: "bpc_fixture",
+      STRIPE_CHANGE_CONFIGURATIONS: "{}",
+    }))
+      vi.stubEnv(key, value);
+    const put = (checkoutAccess: string, origin = "http://localhost:3000") =>
+      billingSettingsPut(
+        new Request("http://localhost:3000/api/owner/billing/settings", {
+          method: "PUT",
+          headers: { Origin: origin },
+          body: JSON.stringify({ checkoutAccess }),
+        }),
+      );
+    const allowed = (who: string) =>
+      hooks.run(who, (tx: any) => checkoutAllowed(tx, who));
+    try {
+      hooks.user = id;
+      expect((await billingSettingsGet()).status).toBe(403);
+      expect((await put("customers")).status).toBe(403);
+      expect(await allowed(id)).toBe(false);
+      expect(await allowed(staff)).toBe(true);
+      expect(
+        (
+          await asRole(
+            "scriblune_server",
+            id,
+            "update private.billing_settings set checkout_access='customers' returning id",
+          )
+        ).rows,
+      ).toHaveLength(0);
+      hooks.user = owner;
+      expect((await put("customers", "https://untrusted.example")).status).toBe(
+        403,
+      );
+      expect((await put("invalid")).status).toBe(400);
+      expect((await put("customers")).status).toBe(200);
+      expect((await put("customers")).status).toBe(200);
+      expect(await allowed(id)).toBe(true);
+      expect(
+        (
+          await pg.query(
+            "select * from private.staff_audit where actor_id=$1 and action='billing_checkout_access'",
+            [owner],
+          )
+        ).rows,
+      ).toHaveLength(1);
+      vi.stubEnv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "pk_live_mismatch");
+      expect(await allowed(id)).toBe(false);
+      vi.stubEnv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "pk_test_fixture");
+      expect((await put("off")).status).toBe(200);
+      expect(await allowed(id)).toBe(false);
+      expect(await allowed(staff)).toBe(false);
+      expect(await allowed(owner)).toBe(false);
+      vi.stubEnv("STRIPE_SECRET_KEY", "sk_live_fixture");
+      vi.stubEnv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "pk_live_fixture");
+      expect(await allowed(owner)).toBe(false);
+      expect((await put("staff")).status).toBe(200);
+      expect(await allowed(id)).toBe(false);
+      expect(await allowed(staff)).toBe(true);
+      expect(await allowed(owner)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      await pg.query(
+        "update private.billing_settings set checkout_access='staff'",
+      );
+    }
+  });
+  it("a live-key transition excludes simulated entitlements and archives test billing before a new checkout", async () => {
+    const id = await member();
+    await usage(id);
+    await pg.query(
+      "update private.billing_accounts set customer_id='cus_old_test',subscription_id='sub_old_test',subscription_plan='focus',subscription_status='active',paid_until=now()+interval '30 days',bonus_credits=3 where account_id=$1",
+      [id],
+    );
+    expect((await usage(id)).plan.key).toBe("focus");
+    for (const [key, value] of Object.entries({
+      STRIPE_SECRET_KEY: "sk_live_fixture",
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: "pk_live_fixture",
+      STRIPE_WEBHOOK_SECRET: "whsec_fixture",
+      STRIPE_PRODUCT_ID: "prod_fixture",
+      STRIPE_PORTAL_CONFIGURATION_ID: "bpc_fixture",
+      STRIPE_CHANGE_CONFIGURATIONS: "{}",
+    }))
+      vi.stubEnv(key, value);
+    await pg.query(
+      "update private.billing_settings set checkout_access='customers'",
+    );
+    const provider = stripe();
+    const prices = vi.spyOn(provider.prices, "list").mockResolvedValue({
+      data: [
+        {
+          id: "price_live_fixture",
+          product: "prod_fixture",
+          metadata: { plan: "focus", daily_credits: "20" },
+          unit_amount: 1000,
+          currency: "usd",
+          recurring: { interval: "month", interval_count: 1 },
+          lookup_key: "scriblune_v1_focus",
+        },
+      ],
+    } as any);
+    const customer = vi
+      .spyOn(provider.customers, "create")
+      .mockResolvedValue({ id: "cus_new_live" } as any);
+    const checkout = vi
+      .spyOn(provider.checkout.sessions, "create")
+      .mockImplementation(
+        async (args: any) =>
+          ({
+            id: "cs_new_live",
+            client_secret: "client_fixture",
+            metadata: args.metadata,
+          }) as any,
+      );
+    const retrieve = vi.spyOn(provider.subscriptions, "retrieve");
+    try {
+      const before = await usage(id);
+      expect(before.plan.key).toBe("free");
+      expect(before.subscription).toBeNull();
+      expect(before.credits.bonus).toBe(3);
+      await startCheckout(id, "synthetic@example.com", "focus", 30);
+      expect(retrieve).not.toHaveBeenCalled();
+      const row = (
+        await pg.query(
+          "select * from private.billing_accounts where account_id=$1",
+          [id],
+        )
+      ).rows[0] as any;
+      expect(row.stripe_livemode).toBe(true);
+      expect(row.customer_id).toBe("cus_new_live");
+      expect(row.subscription_id).toBeNull();
+      expect(row.test_billing_archive.customer_id).toBe("cus_old_test");
+      expect(row.bonus_credits).toBe(3);
+      expect((await usage(id)).plan.key).toBe("free");
+    } finally {
+      prices.mockRestore();
+      customer.mockRestore();
+      checkout.mockRestore();
+      retrieve.mockRestore();
+      vi.unstubAllEnvs();
+      await pg.query(
+        "update private.billing_settings set checkout_access='staff'",
+      );
+    }
+  });
+  it("accepts only verified current Stripe state, ignores stale subscription replacements, and deduplicates events", async () => {
+    const id = await member(),
+      purchase = randomUUID();
+    await usage(id);
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_fixture_not_a_real_key");
+    vi.stubEnv("STRIPE_PRODUCT_ID", "prod_fixture");
+    const provider = stripe();
+    let sub: any = {
+      id: "sub_test_billing",
+      customer: "cus_fixture",
+      metadata: { account_id: id, purchase_key: purchase },
+      status: "active",
+      cancel_at_period_end: false,
+      items: {
+        data: [
+          {
+            quantity: 1,
+            current_period_end: Math.floor(Date.now() / 1000) + 86400,
+            price: {
+              product: "prod_fixture",
+              currency: "usd",
+              unit_amount: 1000,
+              recurring: { interval: "month", interval_count: 1 },
+              lookup_key: "scriblune_v1_focus",
+              metadata: { plan: "focus", daily_credits: "20" },
+            },
+          },
+        ],
+      },
+    };
+    const mock = vi
+      .spyOn(provider.subscriptions, "retrieve")
+      .mockImplementation(async () => sub);
+    try {
+      await pg.query(
+        "update private.billing_accounts set customer_id='cus_fixture',checkout_key=$2 where account_id=$1",
+        [id, purchase],
+      );
+      const event: any = {
+        id: "evt_fixture_paid",
+        type: "customer.subscription.updated",
+        livemode: false,
+        data: { object: { id: sub.id, status: "canceled" } },
+      };
+      await handleBillingEvent(event);
+      await handleBillingEvent(event);
+      expect((await usage(id)).plan.key).toBe("focus");
+      expect(
+        (
+          await pg.query("select * from private.billing_events where id=$1", [
+            event.id,
+          ])
+        ).rows,
+      ).toHaveLength(1);
+      sub = { ...sub, status: "canceled" };
+      await handleBillingEvent({
+        ...event,
+        id: "evt_old_snapshot",
+        data: { object: { id: sub.id, status: "active" } },
+      });
+      expect((await usage(id)).plan.key).toBe("free");
+      await pg.query(
+        "update private.billing_accounts set subscription_id='sub_newer',checkout_key=$2,subscription_status='active',subscription_plan='plus' where account_id=$1",
+        [id, randomUUID()],
+      );
+      sub = { ...sub, status: "active" };
+      await hooks.run(id, (tx: any) => syncSubscription(tx, id, sub.id));
+      expect((await usage(id)).plan.key).toBe("plus");
+      await expect(
+        hooks.run(await member(), (tx: any) =>
+          syncSubscription(tx, id, sub.id),
+        ),
+      ).rejects.toThrow();
+    } finally {
+      mock.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+  it("rejects unsigned and tampered payment webhooks", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_fixture_not_a_real_key");
+    vi.stubEnv("STRIPE_WEBHOOK_SECRET", "whsec_fixture_not_a_real_secret");
+    try {
+      const body = JSON.stringify({
+        id: "evt_bad",
+        type: "invoice.paid",
+        livemode: false,
+        data: { object: {} },
+      });
+      expect(
+        (
+          await billingWebhook(
+            new Request("http://localhost/api/billing/webhook", {
+              method: "POST",
+              body,
+            }),
+          )
+        ).status,
+      ).toBe(400);
+      const signature = stripe().webhooks.generateTestHeaderString({
+        payload: body,
+        secret: process.env.STRIPE_WEBHOOK_SECRET!,
+      });
+      expect(
+        (
+          await billingWebhook(
+            new Request("http://localhost/api/billing/webhook", {
+              method: "POST",
+              body: body + " ",
+              headers: { "stripe-signature": signature },
+            }),
+          )
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await billingWebhook(
+            new Request("http://localhost/api/billing/webhook", {
+              method: "POST",
+              body,
+              headers: { "stripe-signature": signature },
+            }),
+          )
+        ).status,
+      ).toBe(200);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

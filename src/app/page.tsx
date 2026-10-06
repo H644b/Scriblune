@@ -138,14 +138,14 @@ export default function Home() {
                 viewBox="0 0 460 200"
                 aria-label="A sample diagram connects a claim to two pieces of evidence"
               >
-                <g fill="none" stroke="#4361ee" strokeWidth="2">
+                <g fill="none" stroke="var(--blue)" strokeWidth="2">
                   <rect x="162" y="25" width="140" height="54" rx="9" />
                   <path d="M232 79V112H88v23m144-23h144v23" />
                   <rect x="24" y="135" width="128" height="46" rx="8" />
                   <rect x="310" y="135" width="128" height="46" rx="8" />
                 </g>
                 <g
-                  fill="#263044"
+                  fill="var(--ink)"
                   textAnchor="middle"
                   fontFamily="Georgia"
                   fontSize="18"
@@ -281,18 +281,28 @@ export default function Home() {
           </span>
           <h2>Just bring your page.</h2>
           <StartButton label="Let’s work it out" />
-          <p>PDF, PNG, JPEG & WebP · Adult pilot, ages 18+</p>
+          <p>PDF, PNG, JPEG & WebP</p>
         </section>
       </main>
       <footer className="site-footer">
         <Logo />
         <span>{brand.tagline}</span>
         <nav aria-label="Footer">
+          <Link href="/forum">Community forum</Link>
           <Link href="/privacy">Privacy</Link>
+          <Link href="/plans">Plans & pricing</Link>
           <Link href="/terms">Terms & limitations</Link>
-          <Link href="/setup">Setup status</Link>
         </nav>
-        <span>© {new Date().getFullYear()} Scriblune</span>
+        <span>
+          © {new Date().getFullYear()} Scriblune · Built by{" "}
+          <a
+            href="https://teriontic.tech"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Teriontic
+          </a>
+        </span>
       </footer>
       <ResumeAuth />
     </>

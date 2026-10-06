@@ -2,7 +2,6 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { requireUser } from "@/lib/supabase/server";
 import { accountTx, ownedSession } from "@/lib/server/db";
-import { requirePilot } from "@/lib/server/config";
 import { storage, storeFile } from "@/lib/server/storage";
 import { MAX_BYTES, validateFile } from "@/lib/ingestion/validation";
 import {
@@ -20,7 +19,6 @@ export async function POST(
   try {
     sameOrigin(request);
     const user = await requireUser();
-    requirePilot();
     const id = z.uuid().parse((await c.params).id);
     await accountTx(user.id, async (tx) => {
       await ownedSession(tx, id, { draft: true });

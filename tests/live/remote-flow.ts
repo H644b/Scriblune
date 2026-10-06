@@ -71,7 +71,17 @@ try {
       data: { mode: "signin", email, password },
     });
     assert.equal(sign.status(), 200, "Actual auth handler signs in");
-    await sql`insert into public.profiles(id,adult_attested_at,display_name) values(${data.user.id},now(),'Synthetic QA account')`;
+    if (base.startsWith("https://")) {
+      const sessionCookies = (await context.cookies()).filter((cookie: any) =>
+        cookie.name.startsWith("sb-"),
+      );
+      assert.ok(sessionCookies.length > 0, "Sign-in sets session cookies");
+      assert.ok(
+        sessionCookies.every((cookie: any) => cookie.secure),
+        "Public HTTPS sessions must use Secure cookies",
+      );
+    }
+    await sql`update public.profiles set display_name='Synthetic QA account' where id=${data.user.id}`;
   }
   const [a, b] = accounts,
     request = a.context.request;
@@ -287,7 +297,7 @@ try {
     },
   );
   assert.ok([403, 404, 406].includes(ordinary.status));
-  await sql`insert into private.admin_memberships(account_id,role) values(${b.id},'reviewer')`;
+  await sql`insert into private.staff_assignments(account_id,role_key) values(${b.id},'reviewer')`;
   const staff = await b.context.request.get("/api/admin/feedback");
   assert.equal(staff.status(), 200);
   const staffData = await staff.json();
@@ -312,6 +322,7 @@ try {
     JSON.stringify(
       {
         time: new Date().toISOString(),
+        base_url: base,
         passed,
         duration_ms: Date.now() - started,
         synthetic_accounts_removed: true,

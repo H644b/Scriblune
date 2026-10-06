@@ -1,3 +1,4 @@
+import { signInDestination } from "@/lib/network-policy";
 import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/supabase/server";
 import { Desk } from "@/components/desk";
@@ -8,8 +9,8 @@ export const metadata = {
 export default async function Page() {
   try {
     await requireUser();
-  } catch {
-    redirect("/?signin=1&next=/desk");
+  } catch (error) {
+    redirect(signInDestination(error, "/?signin=1&next=/desk"));
   }
   return <Desk />;
 }

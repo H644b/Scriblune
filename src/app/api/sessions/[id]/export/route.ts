@@ -21,7 +21,12 @@ export async function GET(
         const submission = (
           await tx`select snapshot from public.submissions where session_id=${id}`
         )[0];
-        return submission.snapshot;
+        if (submission) return submission.snapshot;
+        const test = (
+          await tx`select snapshot from private.test_completions where session_id=${id}`
+        )[0];
+        if (test) return test.snapshot;
+        throw new AppError(409, "The saved completion was not found.");
       }
       return {
         title: s.title,
@@ -51,6 +56,8 @@ export async function GET(
     const pdf = await PDFDocument.create();
     pdf.setTitle(snapshot.title);
     pdf.setCreator("Scriblune");
+    if (snapshot.is_test)
+      pdf.setSubject("Test completion — no grading approval");
     for (const page of snapshot.pages as DocumentPage[]) {
       const objects = (snapshot.objects as Annotation[])
         .filter(

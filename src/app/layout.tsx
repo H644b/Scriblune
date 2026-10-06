@@ -1,4 +1,5 @@
-import type { Metadata } from "next";
+import { themeBootstrap } from "@/lib/theme-bootstrap";
+import type { Metadata, Viewport } from "next";
 import "@fontsource-variable/dm-sans";
 import "@fontsource/fraunces/400.css";
 import "@fontsource/fraunces/500.css";
@@ -21,13 +22,22 @@ export const metadata: Metadata = {
     type: "website",
   },
 };
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f7f3eb" },
+    { media: "(prefers-color-scheme: dark)", color: "#191d24" },
+  ],
+};
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning data-scroll-behavior="smooth">
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeBootstrap }} />
+      </head>
       <body>
         <Providers>{children}</Providers>
       </body>

@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "scriblune",
+  "main": "cloudflare/worker.ts",
+  "account_id": "ae3a72a91b6bc373fbb68cc8a015774d",
+  "compatibility_date": "2026-09-30",
+  "workers_dev": true,
+  "observability": { "enabled": false }
+}

@@ -9,6 +9,7 @@ import {
   type Geometry,
   type Region,
   type WorkspaceAction,
+  type ActionInput,
 } from "../workspace/types";
 import { plotPoints } from "../workspace/expression";
 import { bounds, intersects } from "../workspace/geometry";
@@ -17,6 +18,8 @@ import { commitActions } from "../server/workspace";
 import { renderPage } from "../server/render";
 import { AppError } from "../server/errors";
 import { jsonSchema } from "./provider";
+import { layoutWorkedSteps, wrapNote } from "./note-layout";
+import { numberLine } from "./number-line";
 const id = z.uuid();
 const region = z
   .object({
@@ -28,6 +31,51 @@ const region = z
   .strict();
 const point = z.object({ x: z.number(), y: z.number() }).strict();
 export const toolSchemas = {
+  draw_number_line: z
+    .object({
+      page_id: id,
+      region,
+      minimum: z.number(),
+      maximum: z.number(),
+      ticks: z.array(z.number()).min(2).max(12),
+      intervals: z
+        .array(
+          z
+            .object({
+              start: z.number(),
+              end: z.number(),
+              label: z.string().min(1).max(100),
+              color: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+              open_start: z.boolean(),
+              open_end: z.boolean(),
+            })
+            .strict(),
+        )
+        .min(1)
+        .max(4),
+      replace_object_ids: z.array(id).max(60),
+    })
+    .strict(),
+  create_tutor_page: z.object({ title: z.string().min(1).max(100) }).strict(),
+  write_worked_steps: z
+    .object({
+      page_id: id,
+      region,
+      replace_object_ids: z.array(id).max(60),
+      heading: z.string().min(1).max(100),
+      steps: z
+        .array(
+          z
+            .object({
+              explanation: z.string().min(1).max(240),
+              math: z.string().max(240),
+            })
+            .strict(),
+        )
+        .min(1)
+        .max(8),
+    })
+    .strict(),
   inspect_workspace: z.object({}).strict(),
   inspect_region: z.object({ page_id: id, region }).strict(),
   read_page: z.object({ page_id: id }).strict(),
@@ -114,6 +162,12 @@ export const toolSchemas = {
     .strict(),
 };
 const descriptions: Record<keyof typeof toolSchemas, string> = {
+  draw_number_line:
+    "Draw a complete editable number line with ticks, labeled intervals and open/closed endpoints in ONE call. Use for disjoint MVT intervals, inequalities and ranges. Choose clear space, at least 240px wide and 100 + 65px per interval tall. Use replace_object_ids when replacing your old diagram. Never draw a guessed function curve for a table.",
+  create_tutor_page:
+    "Create a blank 1000×1294 teaching page when the assignment has no clear writing area. Does not change the student's active page. Return its page ID for drawing and link it in your reply.",
+  write_worked_steps:
+    "Write neatly spaced, editable numbered explanation steps and Unicode math on the page. Choose a clear region. For a rewrite, pass ALL old tutor annotation IDs being replaced; deletion and new writing commit atomically. Never pass student IDs. Does not overwrite original media or unrelated annotations. Use together with a relevant diagram, arrows, highlight, or graph when helpful.",
   inspect_workspace:
     "Read current revisions, page index, annotations, and roles. Indexed pages are not necessarily visually inspected.",
   inspect_region:
@@ -203,6 +257,160 @@ export async function executeTool(
   const current = a.object_id
     ? objects.find((o) => o.id === a.object_id)
     : null;
+  if (name === "create_tutor_page") {
+    const docId = randomUUID(),
+      pageId = randomUUID();
+    const created = await accountTx(c.accountId, async (tx) => {
+      await ownedSession(tx, c.sessionId, { lock: true, draft: true });
+      const [turn] =
+        await tx`select status from public.tutor_turns where id=${c.turnId} and session_id=${c.sessionId}`;
+      if (turn?.status !== "running")
+        throw new AppError(409, "This explanation was stopped.");
+      if (
+        (
+          await tx`select id from public.document_pages where session_id=${c.sessionId}`
+        ).length >= 100
+      )
+        throw new Error(
+          "This session has reached its page limit. Use an existing clear page.",
+        );
+      await tx`insert into public.documents(id,session_id,name,role,mime,storage_path,byte_size,status,page_count) values(${docId},${c.sessionId},${a.title},'scratch','application/x-scriblune-scratch',${`${c.accountId}/${c.sessionId}/${docId}/scratch`},0,'ready',1)`;
+      const [p] =
+        await tx`insert into public.document_pages(id,session_id,document_id,page_number,width,height,original_width,original_height,extraction_method) values(${pageId},${c.sessionId},${docId},1,1000,1294,1000,1294,'scratch') returning *`;
+      return p;
+    });
+    c.emit({
+      type: "page_added",
+      page: created,
+      document: {
+        id: docId,
+        name: a.title,
+        role: "scratch",
+        mime: "application/x-scriblune-scratch",
+        status: "ready",
+        page_count: 1,
+        error: null,
+      },
+    });
+    return {
+      result: {
+        executed: true,
+        page_id: pageId,
+        width: 1000,
+        height: 1294,
+        clear_region: { x: 45, y: 45, width: 910, height: 1204 },
+      },
+    };
+  }
+  if (name === "write_worked_steps" || name === "draw_number_line") {
+    const ids = new Set<string>(a.replace_object_ids);
+    const old = objects.filter((o) => ids.has(o.id));
+    if (
+      old.length !== ids.size ||
+      old.some((o) => o.actor !== "tutor" || o.locked)
+    )
+      throw new Error(
+        "Only existing, unlocked tutor annotations on this page can be replaced. Student work is protected.",
+      );
+    const writingKinds = ["text", "math", "sticky"];
+    const diagramGroups = new Set(
+      objects
+        .filter((o) => o.group && !writingKinds.includes(o.geometry.kind))
+        .map((o) => o.group),
+    );
+    if (
+      name === "write_worked_steps" &&
+      old.some(
+        (o) =>
+          !writingKinds.includes(o.geometry.kind) ||
+          (o.group && diagramGroups.has(o.group)),
+      )
+    )
+      throw new Error(
+        "A writing rewrite cannot erase diagrams or their grouped labels. Replace only the explanation text/math IDs; preserve the illustration.",
+      );
+    if (
+      a.region.x + a.region.width > page!.width ||
+      a.region.y + a.region.height > page!.height
+    )
+      throw new Error("The writing region is outside the page.");
+    const blocks =
+      name === "draw_number_line"
+        ? numberLine(a as any)
+        : layoutWorkedSteps(a.region, a.heading, a.steps).map((b) => ({
+            ...b,
+            color: "#3454b4",
+            fill: "none",
+          }));
+    const occupied = [
+      ...objects
+        .filter((o) => o.visible && !ids.has(o.id))
+        .map((o) => bounds(o.geometry)),
+      ...(page!.source_regions || []).map((r: any) => r.region),
+    ];
+    if (
+      blocks.some((b) =>
+        occupied.some((r) => r && intersects(bounds(b.geometry), r)),
+      )
+    )
+      throw new Error(
+        "This writing would overlap existing content. Include old tutor IDs for a rewrite, choose clear space, or create_tutor_page. Nothing was changed.",
+      );
+    const base = {
+      action_group_id: c.groupId,
+      page_id: a.page_id,
+      base_scene_revision: snapshot.s.scene_revision,
+      locked: null,
+      group: name === "draw_number_line" ? randomUUID() : null,
+    };
+    const inputs: ActionInput[] = [
+      ...old.map((o) => ({
+        ...base,
+        action_id: randomUUID(),
+        object_id: o.id,
+        operation_type: "delete" as const,
+        base_object_revision: o.revision,
+        geometry: null,
+        style: null,
+        visible: null,
+      })),
+      ...blocks.map((b) => ({
+        ...base,
+        action_id: randomUUID(),
+        object_id: randomUUID(),
+        operation_type: "create" as const,
+        base_object_revision: null,
+        geometry: b.geometry,
+        style: {
+          ...defaultStyle,
+          fontSize: b.fontSize,
+          color: b.color,
+          fill: b.fill,
+        },
+        visible: true,
+      })),
+    ];
+    const result = await commitActions(
+      c.accountId,
+      c.sessionId,
+      inputs,
+      "tutor",
+      c.turnId,
+    );
+    for (const action of result.actions)
+      c.emit({ type: "action", action, work_revision: result.work_revision });
+    return {
+      result: {
+        executed: true,
+        page_id: a.page_id,
+        removed_object_ids: [...ids],
+        object_ids: result.actions
+          .filter((a) => a.after)
+          .map((a) => a.object_id),
+        action_group_id: c.groupId,
+      },
+    };
+  }
   if (name === "inspect_workspace")
     return {
       result: {
@@ -363,8 +571,25 @@ export async function executeTool(
           page!.width - a.position.x,
           a.text.length * a.font_size * 0.6,
         ),
-        height: a.font_size * 1.5,
-        text: a.text,
+        height:
+          wrapNote(
+            a.text,
+            Math.min(
+              page!.width - a.position.x,
+              a.text.length * a.font_size * 0.67,
+            ),
+            a.font_size,
+          ).length *
+          a.font_size *
+          1.5,
+        text: wrapNote(
+          a.text,
+          Math.min(
+            page!.width - a.position.x,
+            a.text.length * a.font_size * 0.67,
+          ),
+          a.font_size,
+        ).join("\n"),
       },
       { ...defaultStyle, fontSize: a.font_size, color: a.color },
     );

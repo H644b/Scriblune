@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   Paperclip,
@@ -15,6 +15,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { Mark } from "./brand";
+import { UsageIndicator } from "./billing-usage";
 import type { Message, Memory, Region } from "@/lib/workspace/types";
 export function RichText({
   text,
@@ -60,6 +61,7 @@ export function RichText({
 export function Chat({
   messages,
   streamText,
+  streamTurnId,
   activity,
   busy,
   onSend,
@@ -76,9 +78,10 @@ export function Chat({
 }: {
   messages: Message[];
   streamText: string;
+  streamTurnId: string | null;
   activity: string;
   busy: boolean;
-  onSend: (text: string) => void;
+  onSend: (text: string) => Promise<boolean>;
   onStop: () => void;
   onAttach: () => void;
   onReference: (pageId: string, objectId?: string) => void;
@@ -102,13 +105,33 @@ export function Chat({
     );
     return () => recognizer.current?.abort();
   }, []);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (nearBottom.current && scroller.current)
       scroller.current.scrollTop = scroller.current.scrollHeight;
-  }, [messages, streamText, activity]);
+  }, [messages, streamText, busy]);
+  const renderedMessages: Message[] =
+    streamText &&
+    streamTurnId &&
+    !messages.some((m) => m.role === "tutor" && m.turn_id === streamTurnId)
+      ? [
+          ...messages,
+          {
+            id: streamTurnId,
+            turn_id: streamTurnId,
+            role: "tutor",
+            content: streamText,
+            status: "complete",
+            created_at: "",
+            references_json: [],
+          },
+        ]
+      : messages;
   function send() {
     if (!text.trim() || busy) return;
-    onSend(text.trim());
+    const message = text.trim();
+    void onSend(message).then((accepted) => {
+      if (!accepted) setText((current) => current || message);
+    });
     setText("");
     nearBottom.current = true;
   }
@@ -183,8 +206,12 @@ export function Chat({
             </p>
           </div>
         )}
-        {messages.map((m, i) => (
-          <div key={m.id} className={`message ${m.role}`}>
+        {renderedMessages.map((m) => (
+          <div
+            key={`${m.turn_id || m.id}:${m.role}`}
+            className={`message ${m.role}`}
+            data-turn-id={m.turn_id}
+          >
             <div
               className={`bubble ${m.role === "student" ? "student" : "tutor"}`}
             >
@@ -204,12 +231,14 @@ export function Chat({
               </div>
             )}
             <span className="message-time">
-              {demo
-                ? "Sample"
-                : new Date(m.created_at).toLocaleTimeString([], {
-                    hour: "numeric",
-                    minute: "2-digit",
-                  })}
+              {!m.created_at
+                ? "Writing…"
+                : demo
+                  ? "Sample"
+                  : new Date(m.created_at).toLocaleTimeString([], {
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })}
               {m.status === "interrupted"
                 ? " · Stopped"
                 : m.status === "failed"
@@ -219,13 +248,6 @@ export function Chat({
             </span>
           </div>
         ))}
-        {streamText && (
-          <div className="message tutor">
-            <div className="bubble tutor streaming">
-              <RichText text={streamText} onReference={onReference} />
-            </div>
-          </div>
-        )}
         {busy && !streamText && (
           <div className="thinking" role="status">
             <span />
@@ -259,8 +281,12 @@ export function Chat({
             <Scan size={13} /> Asking about your selection
           </div>
         )}
-        {!demo && !busy && !readOnly && aiAvailable && (
-          <div className="chat-suggestions">
+        {!demo && !readOnly && aiAvailable && (
+          <div
+            className="chat-suggestions"
+            style={{ visibility: busy ? "hidden" : "visible" }}
+            aria-hidden={busy}
+          >
             {[
               selection
                 ? "Explain the part I selected."
@@ -268,7 +294,12 @@ export function Chat({
               "Show a different strategy.",
               "Check what I wrote.",
             ].map((t) => (
-              <button key={t} onClick={() => onSend(t)}>
+              <button
+                key={t}
+                disabled={busy}
+                tabIndex={busy ? -1 : 0}
+                onClick={() => onSend(t)}
+              >
                 {t}
               </button>
             ))}
@@ -307,6 +338,7 @@ export function Chat({
             }}
           />
           <div className="composer-controls">
+            <UsageIndicator demo={demo} busy={busy} />
             <button
               type="button"
               className="icon-button"

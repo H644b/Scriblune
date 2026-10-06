@@ -6,6 +6,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
     "/",
     "/privacy",
     "/terms",
+    "/forum",
+    "/plans",
     ...features.map((f) => `/features/${f.slug}`),
   ].map((path) => ({ url: `${brand.url}${path}` }));
 }

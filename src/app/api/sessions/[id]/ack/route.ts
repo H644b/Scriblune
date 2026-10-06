@@ -28,7 +28,9 @@ export async function POST(
         ).length
       )
         throw new AppError(404, "Drawing event not found.");
-      await tx`update public.tutor_turns set displayed_action_ids=array_append(displayed_action_ids,${b.action_id}::uuid) where id=${b.turn_id} and session_id=${id} and status in ('running','complete') and not (${b.action_id}::uuid=any(displayed_action_ids))`;
+      // The client displays events sequentially. A later acknowledgment also
+      // confirms earlier deletions if an individual acknowledgment was lost.
+      await tx`update public.tutor_turns set displayed_action_ids=array(select distinct event_id from unnest(displayed_action_ids || array(select e.id from public.workspace_events e where e.turn_id=${b.turn_id} and e.session_id=${id} and e.actor='tutor' and e.sequence_number <= (select sequence_number from public.workspace_events where id=${b.action_id} and session_id=${id}))) as event_id) where id=${b.turn_id} and session_id=${id} and status in ('running','complete')`;
     });
     return json({ acknowledged: true });
   } catch (e) {

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { requireUser } from "@/lib/supabase/server";
 import { accountTx } from "@/lib/server/db";
-import { requireAdmin } from "@/lib/server/admin";
+import { requirePermission } from "@/lib/server/admin";
 import {
   sameOrigin,
   bodyJson,
@@ -14,12 +14,7 @@ export async function GET() {
     const u = await requireUser();
     return json(
       await accountTx(u.id, async (tx) => {
-        const member = await requireAdmin(tx, u.id);
-        if (member.role !== "admin")
-          throw new AppError(
-            403,
-            "Privacy requests require a privacy administrator.",
-          );
+        await requirePermission(tx, u.id, "privacy.manage");
         await tx`insert into private.admin_audit_log(admin_id,action) values(${u.id},'read_privacy_requests')`;
         return {
           requests:
@@ -44,9 +39,7 @@ export async function PATCH(request: Request) {
       .strict()
       .parse(await bodyJson(request));
     await accountTx(u.id, async (tx) => {
-      const member = await requireAdmin(tx, u.id);
-      if (member.role !== "admin")
-        throw new AppError(403, "Privacy administrator required.");
+      await requirePermission(tx, u.id, "privacy.manage");
       const row = (
         await tx`select * from private.privacy_requests where id=${b.id} for update`
       )[0];

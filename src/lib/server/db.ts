@@ -25,8 +25,11 @@ export function db() {
 export async function accountTx<T>(
   accountId: string,
   fn: (tx: Tx) => Promise<T>,
+  options: { readOnlySnapshot?: boolean } = {},
 ): Promise<T> {
   return db().begin(async (tx) => {
+    if (options.readOnlySnapshot)
+      await tx`set transaction isolation level repeatable read, read only`;
     await tx`select set_config('app.account_id',${accountId},true)`;
     await tx`set local role scriblune_server`;
     return fn(tx);

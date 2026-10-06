@@ -167,6 +167,8 @@ export type Memory = {
   version: number;
 };
 export type Session = {
+  updated_at?: string;
+  is_test?: boolean;
   id: string;
   title: string;
   subject: string;

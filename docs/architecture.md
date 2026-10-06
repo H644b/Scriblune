@@ -2,7 +2,7 @@
 
 ## Trust and persistence
 
-The browser is an untrusted editor. Every API route independently validates Supabase `getUser()`, verified email, request body, and session ownership. Mutations check same-origin. The server uses a dedicated Postgres login that can `SET LOCAL ROLE scriblune_server`; `app.account_id` is set only inside its transaction. Browser credentials never receive model, database, or privileged storage keys.
+The browser is an untrusted editor. Every API route independently validates Supabase `getUser()`, verified email, any required email second-step session grant, request body, and session ownership. Mutations check same-origin. The server uses a dedicated Postgres login that can `SET LOCAL ROLE scriblune_server`; `app.account_id` is set only inside its transaction. Browser credentials never receive model, database, or privileged storage keys.
 
 Authoritative state lives in PostgreSQL. Actions lock the session, check per-object revisions, validate page bounds and authorship, update the object, append an immutable event, and advance revisions atomically. Action IDs deduplicate retries. The model and browser cannot choose their actor, account, authoritative sequence, or eligibility. A snapshot is recorded every 50 scene actions.
 
@@ -28,7 +28,7 @@ The adapter interface in `ingestion/adapters.ts` yields canonical pages with ima
 
 Each tutor turn includes current revisions, page/annotation identities, selected IDs/crop, the current original-plus-ink image, recent conversation, exact-source summary, relevant older messages, active learning memories, enabled account preferences, source regions, and rubric context. The full document index distinguishes indexed content from images actually inspected in this turn. Retrieval is lexical and bounded, not a vector database. Problem-ledger entries must cite exact quotes from known messages; demonstrated-understanding evidence must come from student messages. Summary or ledger failure cannot delete the transcript.
 
-`provider.ts` isolates Responses-specific calls. `tools.ts` defines every allowlisted tool and schema. Tool execution results are returned to the model. There is no model-accessible arbitrary code, shell, network, database query, or review-approval tool. Document instructions are untrusted input.
+`provider.ts` isolates Responses-specific calls. `tools.ts` defines every allowlisted tool and schema. Tool execution results are returned to the model. Explicit written explanations use `write_worked_steps`, which wraps short equations and reasoning into editable objects. Rewrites validate all target IDs and available space before atomically deleting old tutor text and creating its replacement. Student marks are protected. A dedicated teaching page can be created without taking over the viewport. There is no model-accessible arbitrary code, shell, network, database query, or review-approval tool. Document instructions are untrusted input.
 
 ## Review, final versions, and feedback
 

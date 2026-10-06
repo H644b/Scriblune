@@ -1,4 +1,5 @@
 "use client";
+import { ThemeToggle } from "@/components/theme";
 import { useState } from "react";
 import Link from "next/link";
 import { Star, Check, LockKeyhole, Download, LoaderCircle } from "lucide-react";
@@ -10,9 +11,11 @@ export function FeedbackPage({ id }: { id: string }) {
   const q = useQuery({
     queryKey: ["feedback-questions", id],
     queryFn: () =>
-      api<{ received: boolean; questions: FeedbackQuestion[] }>(
-        `/api/sessions/${id}/feedback`,
-      ),
+      api<{
+        received: boolean;
+        questions: FeedbackQuestion[];
+        is_test: boolean;
+      }>(`/api/sessions/${id}/feedback`),
   });
   const [rating, setRating] = useState(0),
     [answers, setAnswers] = useState<
@@ -79,8 +82,19 @@ export function FeedbackPage({ id }: { id: string }) {
       <header className="desk-header">
         <Logo />
         <Link href="/desk">Back to my desk</Link>
+      <ThemeToggle />
       </header>
       <main className="feedback-main">
+        {q.data?.is_test && (
+          <div className="community-notice">
+            <strong>Test feedback</strong>
+            <span>
+              This session is marked as a test. These ratings are kept separate
+              from regular student feedback.
+            </span>
+            <Link href="/admin?tab=testing">Return to test lab →</Link>
+          </div>
+        )}
         <span className="completion-seal">
           <Check size={25} />
         </span>

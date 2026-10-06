@@ -1,0 +1,29 @@
+.syncBar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 3px 18px 5px;
+  min-height: 24px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.syncBar button {
+  font-size: 11px;
+  margin: 0;
+}
+.copyNotice {
+  padding: 8px 16px;
+  background: var(--white);
+  color: var(--sage);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.imageActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}

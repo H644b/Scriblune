@@ -1,8 +1,10 @@
+import { captureFreeTier } from "@/lib/server/free-tier-guard";
 import { z } from "zod";
 import { requireUser } from "@/lib/supabase/server";
 import { accountTx, ownedSession } from "@/lib/server/db";
 import { requireAI } from "@/lib/server/config";
 import { runTutor } from "@/lib/ai/tutor";
+import { reserveUsage, refundPrompt } from "@/lib/server/usage";
 import {
   sameOrigin,
   bodyJson,
@@ -40,6 +42,7 @@ export async function POST(
     const id = z.uuid().parse((await c.params).id);
     const b = schema.parse(await bodyJson(request));
     requireAI("tutor");
+    await captureFreeTier(u.id);
     const duplicate = await accountTx(u.id, async (tx) => {
       const s = await ownedSession(tx, id, { lock: true, draft: true });
       if (
@@ -52,7 +55,9 @@ export async function POST(
         await tx`select status from public.tutor_turns where id=${b.turn_id} and session_id=${id}`
       )[0];
       if (existing) return existing;
-      await tx`update public.tutor_turns set status='failed',finished_at=now() where session_id=${id} and status='running' and created_at<now()-interval '4 minutes'`;
+      const stale =
+        await tx`update public.tutor_turns set status='failed',finished_at=now() where session_id=${id} and status='running' and created_at<now()-interval '4 minutes' returning id`;
+      for (const turn of stale) await refundPrompt(tx, u.id, turn.id);
       if (
         (
           await tx`select id from public.tutor_turns where session_id=${id} and status='running'`
@@ -62,23 +67,17 @@ export async function POST(
           409,
           "A tutor turn is already in progress. Stop it before starting another.",
         );
-      const used = (
-        await tx`select count(*)::integer as n from public.tutor_turns t join public.tutoring_sessions s on s.id=t.session_id where s.account_id=${u.id} and t.created_at>now()-interval '1 day'`
-      )[0].n;
-      if (used >= Number(process.env.AI_DAILY_TURN_LIMIT || 100))
-        throw new AppError(
-          429,
-          "Your daily tutor limit has been reached. Your drawing and saved work remain available.",
-        );
+      await reserveUsage(tx, u.id, "prompt", b.turn_id);
       await tx`insert into public.tutor_turns(id,session_id,status,base_scene_revision,base_work_revision) values(${b.turn_id},${id},'running',${s.scene_revision},${s.work_revision})`;
       await tx`insert into public.messages(session_id,turn_id,role,content) values(${id},${b.turn_id},'student',${b.message})`;
       return null;
     });
     if (duplicate) return json({ duplicate: true, status: duplicate.status });
     const encoder = new TextEncoder();
+    const disconnected = new AbortController();
+    let closed = false;
     const stream = new ReadableStream({
       async start(controller) {
-        let closed = false;
         const emit = (event: unknown) => {
           if (!closed) {
             try {
@@ -87,6 +86,7 @@ export async function POST(
               );
             } catch {
               closed = true;
+              disconnected.abort();
             }
           }
         };
@@ -102,10 +102,18 @@ export async function POST(
           emit,
           signal: AbortSignal.any([
             request.signal,
+            disconnected.signal,
             AbortSignal.timeout(170_000),
           ]),
         });
-        if (!closed) controller.close();
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
+      },
+      cancel() {
+        closed = true;
+        disconnected.abort();
       },
     });
     return new Response(stream, {

@@ -3,8 +3,11 @@
 ## Enforced controls
 
 - Every private endpoint independently validates the authenticated Supabase user and owned session. Server checks do not rely on middleware, robot directives, client state, or obscure UUIDs.
+- Signup requires a one-time email code. Optional email, authenticator-app, and passkey second-factor grants are bound to the Supabase session ID, account, email and current security-settings version. Settings changes require an already verified session and the current password; enrollment also proves the new method. Other verified sessions are invalidated on changes.
+- Codes expire after 10 minutes, allow six guesses, and are HMAC-hashed. Pending login tokens are encrypted with AES-GCM. HttpOnly challenge cookies and database-backed per-email/IP limits protect the flow. Expired challenges are cleaned by the persistent worker. Email-based recovery is available, but an account with authenticator/passkey factors and no email factor must also complete a configured second factor before resetting its password. Email two-step relies on security of the same mailbox and is not phishing-resistant MFA.
+- Authenticator seeds use AES-256-GCM with account-bound context. Six-digit, 30-second TOTP codes allow one neighboring time window; accepted counters cannot be reused. Passkeys use SimpleWebAuthn with exact configured origin/RP ID, user verification required, expiring single-use challenges, and stored signature counters. Backup codes are account-bound HMAC hashes, shown once and consumed atomically. Method switches preserve challenge expiry and attempt count; account-level limits also cover new challenges. These are application second-factor checks, not Supabase AAL2 claims.
 - Cookies use Supabase SSR session handling. Mutations validate their origin and bounded strict schemas. Private responses are `no-store` and `noindex`; file responses require the same ownership check.
-- Browser database roles are read-only for owned public application records. They cannot write tutor roles, reviews, submissions, authoritative actions, or eligibility. Composite foreign keys prevent cross-session page/document/review references.
+- Browser database roles have no direct access to application tables. Reads and writes use authenticated app routes, preventing a password-only Supabase token from bypassing optional two-factor verification. Composite foreign keys prevent cross-session page/document/review references.
 - A restricted server role is scoped to `app.account_id` in each transaction. Application code never reuses a session-level account setting. Immutable records revoke update/delete even from that role.
 - Private feedback schemas revoke access from PUBLIC, anon, authenticated, and service_role. RLS additionally limits inserts to the submitter and reads/updates to protected staff membership. The secret Storage key is not used to bypass private-table access.
 - Staff feedback reads and changes are audited. User-editable metadata has no relationship to membership. Privacy fulfillment requires role `admin`, a verified request, and a separate offline operator connection.
@@ -14,6 +17,7 @@
 - Model tool schemas are allowlisted and additionally checked for ownership, page bounds, object revisions, actor permissions, current work revision, and active turn. Mathematical input is parsed without eval.
 - Model review output cannot directly approve submission. The server validates evidence/scope and derives readiness; the final transaction matches immutable review/rubric/work revisions. No `approved=true` input exists.
 - Secret values and private content are excluded from logs and errors. The setup checker reports presence and validation outcomes only.
+- The VM console is limited to protected site Owners and bound to one authenticated login. Opening the terminal checks the verified Supabase user. Subsequent operations use signature-verified JWT claims and one database call for current ownership, live auth-session state, and the current second-factor grant. Output authorizes after waiting and before returning any bytes; a server sweep also closes revoked sessions. The database helper is SECURITY INVOKER, performs transaction-local role/account setup, and is inaccessible to browser roles; no permission result is cached. It uses a dedicated, source-restricted SSH key, verifies the host key, forbids user-selected hosts, limits session lifetime and buffers, and records lifecycle metadata only. The browser receives neither SSH credentials nor forwarding access. This Owner capability is a real administrative shell on the production VM, including the VM user's existing sudo privileges.
 
 ## Boundaries that still need deployment verification
 
@@ -27,7 +31,7 @@ Output from a model can be well-formed and still educationally wrong. The live a
 
 ## Retention and privacy operations
 
-Saved work and feedback are retained until a governed request is fulfilled. There is no automatic expiration daemon or implemented guardian-consent system. Publish and operationalize a retention schedule, support owner, backup deletion policy, and provider processing policy before launch.
+Saved work and feedback are retained until a governed request is fulfilled. There is no automatic saved-work expiration or implemented guardian-consent system. Authentication challenges and expired rate limits are cleaned separately. Publish and operationalize a retention schedule, support owner, backup deletion policy, and provider processing policy before launch.
 
 The sample uses localStorage for sample content. Private drawing recovery is opt-in and tab-scoped sessionStorage, cleared after acknowledgment or sign-out. It stores only pending actions, not originals. Browsers necessarily see answers while users type/send them. Post-submission retrieval is the protected boundary.
 

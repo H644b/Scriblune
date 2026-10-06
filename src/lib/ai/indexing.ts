@@ -59,6 +59,8 @@ export async function visualIndex(
       },
     ],
     schema,
+    undefined,
+    { operation: "index" },
   );
   for (const r of [...result.regions, ...result.problems])
     if (

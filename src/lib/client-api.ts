@@ -1,3 +1,14 @@
+import { notifyVpnBlocked } from "./network-policy";
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public code?: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 export async function api<T = Record<string, unknown>>(
   path: string,
   init: RequestInit = {},
@@ -15,7 +26,13 @@ export async function api<T = Record<string, unknown>>(
   const body = await response.json().catch(() => ({
     error: "The connection was interrupted. Your saved work is safe.",
   }));
-  if (!response.ok)
-    throw new Error(body.error || "Something went wrong. Please try again.");
+  if (!response.ok) {
+    notifyVpnBlocked(body);
+    throw new ApiError(
+      body.error || "Something went wrong. Please try again.",
+      response.status,
+      typeof body.code === "string" ? body.code : undefined,
+    );
+  }
   return body as T;
 }

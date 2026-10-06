@@ -61,6 +61,7 @@ export async function POST(
       [{ role: "user", content }],
       schema,
       AbortSignal.timeout(90000),
+      { operation: "rubric" },
     );
     return json(candidate);
   } catch (e) {

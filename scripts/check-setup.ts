@@ -10,6 +10,9 @@ const required = [
   "OPENAI_API_KEY",
   "AI_TUTOR_MODEL",
   "AI_REVIEW_MODEL",
+  "RESEND_API_KEY",
+  "RESEND_FROM_EMAIL",
+  "AUTH_SECRET",
 ];
 let failed = false;
 for (const name of required) {
@@ -17,9 +20,6 @@ for (const name of required) {
   console.log(`${present ? "OK" : "MISSING"} ${name}`);
   if (!present) failed = true;
 }
-console.log(
-  `Adult pilot: ${process.env.ALLOW_ADULT_PILOT === "true" ? "enabled" : "closed"}`,
-);
 console.log(
   `Support contact: ${process.env.SUPPORT_EMAIL ? "configured" : "not configured"}`,
 );
@@ -39,6 +39,16 @@ if (process.argv.includes("--live")) {
         await tx`set local role scriblune_server`;
         await tx`select id from public.tutoring_sessions limit 0`;
         await tx`select id from private.session_feedback limit 0`;
+        await tx`select account_id from private.account_security limit 0`;
+        await tx`select session_id from private.verified_sessions limit 0`;
+        await tx`select id from private.auth_challenges limit 0`;
+        await tx`select key from private.auth_rate_limits limit 0`;
+        const [browser] =
+          await tx`select has_table_privilege('authenticated','public.profiles','SELECT') or has_table_privilege('anon','public.tutoring_sessions','SELECT') as readable`;
+        if (browser.readable)
+          throw new Error(
+            "Browser database access bypasses email two-step verification.",
+          );
         const [grants] =
           await tx`select has_table_privilege(current_user,'public.submissions','UPDATE,DELETE') as mutable`;
         if (grants.mutable) throw new Error("Immutable privileges failed.");

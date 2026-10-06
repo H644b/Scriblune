@@ -2,7 +2,7 @@ import type OpenAI from "openai";
 import { getWorkspace } from "../server/workspace";
 import { accountTx } from "../server/db";
 import { renderPage } from "../server/render";
-import { intersects, bounds } from "../workspace/geometry";
+import { serializeContext } from "./payload";
 import type { Region } from "../workspace/types";
 export async function assembleContext(
   accountId: string,
@@ -50,20 +50,34 @@ export async function assembleContext(
       content: [
         {
           type: "input_text",
-          text: JSON.stringify({
-            kind: "untrusted_workspace_context",
-            scene_revision: w.session.scene_revision,
-            work_revision: w.session.work_revision,
-            active_page: { ...page, render_path: undefined },
+          text: serializeContext({
+            kind: "untrusted_document_context",
+            annotation_geometry:
+              "Dense paths and fills use bounds/counts in text; all ink remains visible in rendered images. Inspect a region for exact visual placement.",
             documents: w.documents,
             all_pages_index: w.pages.map((p) => ({
               id: p.id,
               document_id: p.document_id,
               page_number: p.page_number,
               text: p.text_content,
-              visually_inspected_in_this_turn: p.id === pageId,
             })),
             problems: w.problems,
+          }),
+        },
+        {
+          type: "input_text",
+          text: serializeContext({
+            kind: "untrusted_workspace_context",
+            scene_revision: w.session.scene_revision,
+            work_revision: w.session.work_revision,
+            active_page: {
+              ...page,
+              render_path: undefined,
+              text_content: undefined,
+            },
+            active_page_text_source:
+              "all_pages_index entry with the active page ID",
+            visually_inspected_page_ids: [pageId],
             student_selection: selection,
             selected_annotation_ids: selectionIds,
             annotations: objects,

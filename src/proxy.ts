@@ -6,6 +6,10 @@ export async function proxy(request: NextRequest) {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
     {
+      cookieOptions: {
+        secure:
+          process.env.NEXT_PUBLIC_SITE_URL?.startsWith("https://") === true,
+      },
       cookies: {
         getAll: () => request.cookies.getAll(),
         setAll: (items) => {
@@ -27,8 +31,10 @@ export const config = {
   matcher: [
     "/desk/:path*",
     "/study/:path*",
+    "/quiz/:path*",
     "/feedback/:path*",
     "/admin/:path*",
     "/account/:path*",
+    "/checkout/:path*",
   ],
 };

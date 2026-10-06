@@ -30,6 +30,7 @@ type Props = {
   revision: number;
   disabled: boolean;
   onCommit: (inputs: ActionInput[]) => Promise<void>;
+  onInteraction?: (active: boolean) => void;
   onError: (message: string) => void;
   onText: (kind: "text" | "math" | "sticky", point: Point) => void;
   onGraph: (point: Point) => void;
@@ -43,6 +44,7 @@ export function WorkspaceCanvas({
   revision,
   disabled,
   onCommit,
+  onInteraction,
   onError,
   onText,
   onGraph,
@@ -492,10 +494,18 @@ export function WorkspaceCanvas({
           viewBox={`0 0 ${w} ${h}`}
           width={w * zoom}
           height={h * zoom}
-          onPointerDown={down}
+          onPointerDown={(e) => {
+            if (e.button === 0) onInteraction?.(true);
+            down(e);
+          }}
           onPointerMove={move}
-          onPointerUp={up}
+          onPointerUp={() => {
+            up();
+            onInteraction?.(false);
+          }}
+          onLostPointerCapture={() => onInteraction?.(false)}
           onPointerCancel={() => {
+            onInteraction?.(false);
             drag.current = null;
             setDrawing(null);
             setMoving({});

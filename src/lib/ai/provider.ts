@@ -1,6 +1,11 @@
 import OpenAI from "openai";
 import { z } from "zod";
 import { requireAI } from "../server/config";
+import { recordUsage } from "./usage";
+export type UsageContext = {
+  operation: "ledger" | "index" | "review" | "rubric";
+  turnId?: string;
+};
 export interface StructuredProvider {
   structured<T>(
     kind: "tutor" | "review",
@@ -8,6 +13,7 @@ export interface StructuredProvider {
     input: OpenAI.Responses.ResponseInput,
     schema: z.ZodType<T>,
     signal?: AbortSignal,
+    usageContext?: UsageContext,
   ): Promise<T>;
 }
 export function client() {
@@ -35,6 +41,7 @@ export const provider: StructuredProvider = {
     input: OpenAI.Responses.ResponseInput,
     schema: z.ZodType<T>,
     signal?: AbortSignal,
+    usageContext?: UsageContext,
   ) {
     const response = await client().responses.create(
       {
@@ -53,6 +60,11 @@ export const provider: StructuredProvider = {
         max_output_tokens: 6500,
       },
       { signal },
+    );
+    recordUsage(
+      usageContext?.operation || `structured_${kind}`,
+      response,
+      usageContext,
     );
     if (response.status !== "completed")
       throw new Error("The model did not complete its structured response.");

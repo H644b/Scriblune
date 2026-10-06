@@ -1,3 +1,4 @@
+import { ThemeToggle } from "@/components/theme";
 import Link from "next/link";
 import { Logo } from "@/components/brand";
 export const metadata = {
@@ -10,6 +11,7 @@ export default function Page() {
       <header className="desk-header">
         <Logo />
         <Link href="/">Back home</Link>
+      <ThemeToggle />
       </header>
       <main className="prose-page">
         <span className="eyebrow">CLEAR EXPECTATIONS</span>
@@ -18,11 +20,11 @@ export default function Page() {
           <br />
           Your own thinking.
         </h1>
-        <h2>Who this pilot is for</h2>
+        <h2>Using your study desk</h2>
         <p>
-          The current pilot is for users aged 18 and older. Use only assignments
-          and reference material you have permission to upload. Do not include
-          another person’s sensitive information unnecessarily.
+          Use only assignments and reference material you have permission to
+          upload. Do not include another person’s sensitive information
+          unnecessarily.
         </p>
         <h2>Learning support</h2>
         <p>
@@ -47,6 +49,40 @@ export default function Page() {
           send work to a school, teacher, or learning-management system. Keep a
           separate copy of important work.
         </p>
+        <h2>Community participation</h2>
+        <p>
+          Choose a username before posting in the public forum. Be respectful,
+          avoid sharing personal information, and upload only content you have
+          permission to share. Forum attachments support PNG, JPEG, WebP, and
+          unencrypted PDFs up to 10 MB per file; profile pictures support still
+          images up to 5 MB. Report content that needs moderator attention.
+          Staff may edit or remove posts, close discussions, or suspend forum
+          participation.
+        </p>
+        <h2>Plans, credits, and billing</h2>
+        <p>
+          Paid plans are monthly subscriptions in USD. The price and renewal
+          amount are shown before you subscribe. Manage billing from the plans
+          page to review a plan change, update payment details, or stop renewal.
+          Cancellation keeps access through the paid period; afterward Free
+          applies unless the Owner has granted a different plan.
+        </p>
+        <p>
+          One tutor prompt uses one credit. Daily credits and new-session limits
+          reset at midnight UTC and do not roll over. Bonus credits granted by
+          the Owner carry over and are used after daily credits. Failed tutor
+          requests are refunded. Stopping a response after it starts still uses
+          a credit. Opening saved work and drawing do not spend credits. A new
+          draft after submission counts as a new session. See the{" "}
+          <Link href="/plans">plan comparison</Link> for current allowances.
+        </p>
+        <h2>Testing tools</h2>
+        <p>
+          Authorized testers can complete explicitly marked test sessions
+          without a readiness review. A test completion is not a grading
+          approval. Test ratings are labeled and kept separate from ordinary
+          session feedback.
+        </p>
         <h2>Availability and limitations</h2>
         <p>
           Private storage, background document processing, and AI services
@@ -60,13 +96,6 @@ export default function Page() {
           downloads. Staff review it privately under the{" "}
           <Link href="/privacy">privacy policy</Link>. Unreviewed feedback does
           not automatically retrain the AI.
-        </p>
-        <h2>Before a public launch</h2>
-        <p>
-          The operator must complete the documented launch review and provide
-          final service terms, support contacts, and applicable privacy
-          disclosures. This implementation does not assert legal, educational,
-          or accessibility certification.
         </p>
       </main>
     </>

@@ -1,4 +1,9 @@
 "use client";
+import { ThemeToggle, AppearanceSettings } from "@/components/theme";
+import { AccountSecurity } from "./account-security";
+import { ProfileSettings } from "./profile-settings";
+import { FreeTierStatus } from "./free-tier-status";
+import { BillingSummary, UpgradeLink } from "./billing-usage";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
@@ -27,7 +32,11 @@ export function AccountPanel() {
     <div className="desk-page">
       <header className="desk-header">
         <Logo />
-        <Link href="/desk">Back to my desk</Link>
+        <nav>
+          <ThemeToggle />
+          <UpgradeLink />
+          <Link href="/desk">Back to my desk</Link>
+        </nav>
       </header>
       <main className="account-main">
         <span className="eyebrow">YOUR WAY OF LEARNING</span>
@@ -36,6 +45,11 @@ export function AccountPanel() {
           <br />
           Change what doesn’t.
         </h1>
+        <FreeTierStatus />
+        <BillingSummary />
+        <ProfileSettings />
+        <AppearanceSettings />
+        <AccountSecurity />
         <section className="account-section">
           <h2>Learning preferences</h2>
           <p>
@@ -163,6 +177,9 @@ export function PasswordPanel() {
     [done, setDone] = useState(false);
   return (
     <main className="page-loading">
+      <div className="password-theme">
+        <ThemeToggle />
+      </div>
       <Logo />
       <div className="password-card">
         <h1>A fresh start.</h1>

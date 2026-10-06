@@ -1,0 +1,80 @@
+name: scriblune
+services:
+  web:
+    image: scriblune:${RELEASE_TAG:?Set RELEASE_TAG}
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL}
+        NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}
+        SUPPORT_EMAIL: ${SUPPORT_EMAIL}
+    env_file:
+      - path: runtime.web.env
+        format: raw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${CONSOLE_KEY_DIR:?Set CONSOLE_KEY_DIR}:/run/scriblune-console:ro,Z
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 210s
+    mem_limit: 2g
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }
+  worker:
+    image: scriblune:${RELEASE_TAG:?Set RELEASE_TAG}
+    command: [node, --import, tsx, src/workers/run.ts]
+    env_file:
+      - path: runtime.worker.env
+        format: raw
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 210s
+    mem_limit: 2g
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "const fs=require('fs');try{if(Date.now()-fs.statSync('/tmp/scriblune-worker-health').mtimeMs>240000)process.exit(1)}catch{process.exit(1)}",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }
+  edge:
+    image: caddy:2-alpine
+    env_file:
+      - path: runtime.edge.env
+        format: raw
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,Z
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    depends_on:
+      web: { condition: service_healthy }
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }
+volumes:
+  caddy_data:
+  caddy_config:

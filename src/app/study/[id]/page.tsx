@@ -1,3 +1,4 @@
+import { signInDestination } from "@/lib/network-policy";
 import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/supabase/server";
 import { WorkspaceLoader } from "@/components/workspace-room";
@@ -15,8 +16,13 @@ export default async function Page({
   if (!z.uuid().safeParse(id).success) redirect("/desk");
   try {
     await requireUser();
-  } catch {
-    redirect(`/?signin=1&next=${encodeURIComponent(`/study/${id}`)}`);
+  } catch (error) {
+    redirect(
+      signInDestination(
+        error,
+        `/?signin=1&next=${encodeURIComponent(`/study/${id}`)}`,
+      ),
+    );
   }
   return <WorkspaceLoader sessionId={id} />;
 }

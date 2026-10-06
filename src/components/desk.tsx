@@ -1,9 +1,14 @@
 "use client";
-import { useState } from "react";
+import { NewQuiz } from "./new-quiz";
+import type { QuizSummary } from "@/lib/quiz";
+import quizStyles from "./quiz.module.css";
+import { ThemeToggle } from "@/components/theme";
+import { useRef, useState } from "react";
 import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Plus,
+  CircleHelp,
   FileText,
   BookOpen,
   Check,
@@ -14,23 +19,51 @@ import {
 } from "lucide-react";
 import { Logo, Mark } from "./brand";
 import { api } from "@/lib/client-api";
+import type { StaffAccess } from "@/lib/community";
+import { hasQuizAccess } from "@/lib/plans";
+import { UpgradeLink, useBilling } from "./billing-usage";
 export function Desk() {
+  const requestId = useRef<string | null>(null);
   const cache = useQueryClient(),
     q = useQuery({
       queryKey: ["sessions"],
-      queryFn: () => api<{ sessions: any[]; profile: any }>("/api/sessions"),
+      queryFn: () =>
+        api<{ sessions: any[]; profile: any; access: StaffAccess }>(
+          "/api/sessions",
+        ),
     }),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
-    [adult, setAdult] = useState(false),
     [name, setName] = useState("");
+  const billing = useBilling(!!q.data?.profile);
+  const quizAllowed =
+    !!billing.data && !billing.isError && hasQuizAccess(billing.data.plan.key);
+  const [newQuiz, setNewQuiz] = useState(false);
+  const quizzes = useQuery({
+    queryKey: ["quizzes"],
+    queryFn: () => api<{ quizzes: QuizSummary[] }>("/api/quizzes"),
+    enabled: !!q.data?.profile,
+    refetchInterval: (query) =>
+      query.state.data?.quizzes.some(
+        (q) => !q.locked && q.status === "generating",
+      )
+        ? 5000
+        : false,
+  });
+  const items = [
+    ...(q.data?.sessions || []).map((s) => ({ ...s, kind: "session" })),
+    ...(quizzes.data?.quizzes || []).map((s) => ({ ...s, kind: "quiz" })),
+  ].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
   async function start() {
     setBusy(true);
     setError("");
     try {
       const s = await api<{ id: string }>("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({ title: "A fresh page" }),
+        body: JSON.stringify({
+          title: "A fresh page",
+          request_id: (requestId.current ??= crypto.randomUUID()),
+        }),
       });
       location.href = `/study/${s.id}`;
     } catch (e) {
@@ -38,11 +71,11 @@ export function Desk() {
       setBusy(false);
     }
   }
-  async function attest() {
+  async function saveProfile() {
     try {
       await api("/api/account", {
         method: "POST",
-        body: JSON.stringify({ action: "attest", adult, display_name: name }),
+        body: JSON.stringify({ action: "profile", display_name: name }),
       });
       await q.refetch();
     } catch (e) {
@@ -65,9 +98,13 @@ export function Desk() {
       <header className="desk-header">
         <Logo />
         <nav>
+          <ThemeToggle />
+          <Link href="/forum">Community</Link>
+          {q.data?.access.staff && <Link href="/admin">Staff panel</Link>}
           <Link href="/account">
             <Settings size={16} /> Preferences
           </Link>
+          <UpgradeLink />
           <button className="text-button" onClick={() => void logout()}>
             <LogOut size={16} /> Sign out
           </button>
@@ -84,19 +121,56 @@ export function Desk() {
             </h1>
             <p>Pick up a thought, or make room for a new one.</p>
           </div>
-          <button
-            className="button primary"
-            onClick={() => void start()}
-            disabled={busy || !q.data?.profile}
-          >
-            {busy ? (
-              <LoaderCircle size={18} className="spin" />
-            ) : (
-              <Plus size={18} />
-            )}{" "}
-            New tutoring session
-          </button>
+          <div className={quizStyles.actions}>
+            <button
+              className="button secondary"
+              disabled={busy || !q.data?.profile || billing.isPending}
+              onClick={() => setNewQuiz(true)}
+            >
+              <CircleHelp size={18} />{" "}
+              {billing.isPending
+                ? "Checking quiz access…"
+                : quizAllowed
+                  ? "New Quiz"
+                  : "Quizzes · Plus and above"}
+            </button>
+            <button
+              className="button primary"
+              onClick={() => void start()}
+              disabled={busy || !q.data?.profile}
+            >
+              {busy ? (
+                <LoaderCircle size={18} className="spin" />
+              ) : (
+                <Plus size={18} />
+              )}{" "}
+              New tutoring session
+            </button>
+          </div>
         </div>
+        {!billing.isPending && !quizAllowed && (
+          <p className="muted">
+            Practice quizzes are included with Plus, Focus and Flexible.{" "}
+            <Link href="/plans">Compare plans</Link>. Saved quizzes stay on your
+            desk and unlock when an eligible plan is active.
+          </p>
+        )}
+        <NewQuiz
+          open={newQuiz}
+          onClose={() => setNewQuiz(false)}
+          sessions={q.data?.sessions || []}
+        />
+        {quizzes.error && (
+          <p className="error" role="alert">
+            Quizzes: {quizzes.error.message}{" "}
+            <button
+              className="text-button"
+              onClick={() => void quizzes.refetch()}
+            >
+              Retry
+            </button>
+          </p>
+        )}
         {error && (
           <p className="error" role="alert">
             {error}
@@ -110,16 +184,13 @@ export function Desk() {
             <Link className="button secondary" href="/demo">
               Explore the sample workspace
             </Link>
-            <Link href="/setup">See setup requirements</Link>
+            <span>Please retry in a moment. Your saved sessions are safe.</span>
           </div>
         )}
         {q.data && !q.data.profile && (
           <section className="eligibility-panel">
             <h2>A thoughtful place to start.</h2>
-            <p>
-              This pilot is for adults, ages 18 and older. Access for younger
-              students is not currently offered.
-            </p>
+            <p>Choose the name you’d like to use at your study desk.</p>
             <label>
               Your name{" "}
               <input
@@ -129,20 +200,9 @@ export function Desk() {
                 placeholder="What would you like us to call you?"
               />
             </label>
-            <label className="check-label">
-              <input
-                type="checkbox"
-                checked={adult}
-                onChange={(e) => setAdult(e.target.checked)}
-              />{" "}
-              I am at least 18 years old and agree to the{" "}
-              <Link href="/terms">terms</Link> and{" "}
-              <Link href="/privacy">privacy policy</Link>.
-            </label>
             <button
               className="button primary"
-              disabled={!adult}
-              onClick={() => void attest()}
+              onClick={() => void saveProfile()}
             >
               Open my study desk
             </button>
@@ -155,9 +215,9 @@ export function Desk() {
           <>
             <div className="session-list-heading">
               <h2>Your thinking, in progress.</h2>
-              <span>{q.data.sessions.length} sessions</span>
+              <span>{items.length} sessions and quizzes</span>
             </div>
-            {!q.data.sessions.length ? (
+            {!items.length ? (
               <div className="desk-empty">
                 <div className="desk-empty-icon">
                   <BookOpen size={35} />
@@ -177,28 +237,36 @@ export function Desk() {
               </div>
             ) : (
               <div className="sessions-list">
-                {q.data.sessions.map((s) => (
+                {items.map((s) => (
                   <Link
-                    href={`/study/${s.id}`}
+                    href={`/${s.kind === "quiz" ? "quiz" : "study"}/${s.id}`}
                     key={s.id}
                     className="session-row"
                   >
                     <span
-                      className={`session-icon ${s.status === "submitted" ? "finished" : ""}`}
+                      className={`session-icon ${s.status === "submitted" || s.status === "completed" ? "finished" : ""}`}
                     >
-                      {s.status === "submitted" ? (
+                      {s.kind === "quiz" ? (
+                        <CircleHelp size={23} />
+                      ) : s.status === "submitted" ? (
                         <Check size={23} />
                       ) : (
                         <FileText size={23} />
                       )}
                     </span>
                     <div>
-                      <h3>{s.title}</h3>
+                      <h3>
+                        {s.title}
+                        {s.is_test && (
+                          <span className="test-session-label">Test</span>
+                        )}
+                      </h3>
                       <p>
-                        {s.subject} ·{" "}
-                        {s.status === "submitted"
-                          ? "Final version saved"
-                          : "Open workspace"}
+                        {s.kind === "quiz"
+                          ? s.locked
+                            ? "Quiz · Saved · Plus and above"
+                            : `Quiz · ${s.question_count} questions · ${s.status === "completed" ? `Completed · ${s.correct_count} correct` : s.status === "generating" ? "Generating" : s.status === "failed" ? "Needs another try" : `In progress · ${s.answered} answered`}`
+                          : `${s.subject} · ${s.status === "submitted" ? "Final version saved" : "Open workspace"}`}
                       </p>
                     </div>
                     <span className="session-updated">
@@ -209,9 +277,15 @@ export function Desk() {
                       })}
                     </span>
                     <span className="session-open">
-                      {s.status === "submitted"
-                        ? "View your work"
-                        : "Pick it back up"}
+                      {s.kind === "quiz"
+                        ? s.locked
+                          ? "Unlock quiz"
+                          : s.status === "completed"
+                            ? "View results"
+                            : "Open quiz"
+                        : s.status === "submitted"
+                          ? "View your work"
+                          : "Pick it back up"}
                     </span>
                   </Link>
                 ))}

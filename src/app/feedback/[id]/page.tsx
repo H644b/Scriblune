@@ -1,3 +1,4 @@
+import { signInDestination } from "@/lib/network-policy";
 import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/supabase/server";
 import { accountTx, ownedSession } from "@/lib/server/db";
@@ -16,8 +17,13 @@ export default async function Page({
   let user;
   try {
     user = await requireUser();
-  } catch {
-    redirect(`/?signin=1&next=${encodeURIComponent(`/feedback/${id}`)}`);
+  } catch (error) {
+    redirect(
+      signInDestination(
+        error,
+        `/?signin=1&next=${encodeURIComponent(`/feedback/${id}`)}`,
+      ),
+    );
   }
   const s = await accountTx(user.id, (tx) => ownedSession(tx, id));
   if (s.status !== "submitted") redirect(`/study/${id}`);

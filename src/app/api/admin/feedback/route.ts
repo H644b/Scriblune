@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { requireUser } from "@/lib/supabase/server";
 import { accountTx } from "@/lib/server/db";
-import { requireAdmin } from "@/lib/server/admin";
+import { requireAdmin, requirePermission } from "@/lib/server/admin";
 import {
   sameOrigin,
   bodyJson,
@@ -19,6 +19,9 @@ export async function GET(request: Request) {
       .min(0)
       .max(5)
       .parse(search.get("rating") || 0);
+    const test = z
+      .enum(["regular", "test", "all"])
+      .parse(search.get("test") || "regular");
     const status = z
       .enum(["all", "new", "reviewed", "acted_upon"])
       .parse(search.get("status") || "all");
@@ -35,9 +38,9 @@ export async function GET(request: Request) {
         await requireAdmin(tx, u.id);
         await tx`insert into private.admin_audit_log(admin_id,action) values(${u.id},'read_feedback_list')`;
         const rows =
-          await tx`select f.*,coalesce((select jsonb_agg(a) from private.feedback_answers a where a.feedback_id=f.id),'[]'::jsonb) as answers,coalesce((select jsonb_agg(i.tags) from private.feedback_insights i where i.feedback_id=f.id),'[]'::jsonb) as tags from private.session_feedback f where (${rating}=0 or f.rating=${rating}) and (${status}='all' or f.review_status=${status}) and (${category}='' or f.issue_category=${category}) and (${subject}='' or f.subject=${subject}) order by f.account_id,f.created_at desc limit 200`;
+          await tx`select f.*,coalesce((select jsonb_agg(a) from private.feedback_answers a where a.feedback_id=f.id),'[]'::jsonb) as answers,coalesce((select jsonb_agg(i.tags) from private.feedback_insights i where i.feedback_id=f.id),'[]'::jsonb) as tags from private.session_feedback f where (${test}='all' or f.is_test=(${test}='test')) and (${rating}=0 or f.rating=${rating}) and (${status}='all' or f.review_status=${status}) and (${category}='' or f.issue_category=${category}) and (${subject}='' or f.subject=${subject}) order by f.account_id,f.created_at desc limit 200`;
         const counts =
-          await tx`select issue_category,review_status,count(*)::integer as count from private.session_feedback group by issue_category,review_status`;
+          await tx`select issue_category,review_status,count(*)::integer as count from private.session_feedback where (${test}='all' or is_test=(${test}='test')) group by issue_category,review_status`;
         return { feedback: rows, aggregation: counts };
       }),
     );
@@ -70,7 +73,7 @@ export async function PATCH(request: Request) {
       .strict()
       .parse(await bodyJson(request));
     await accountTx(u.id, async (tx) => {
-      await requireAdmin(tx, u.id);
+      await requirePermission(tx, u.id, "feedback.triage");
       const row =
         await tx`update private.session_feedback set review_status=${b.status},severity=${b.severity},issue_category=${b.category},reviewed_at=now() where id=${b.id} returning id`;
       if (!row.length) throw new AppError(404, "Feedback not found.");

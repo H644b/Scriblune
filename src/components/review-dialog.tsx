@@ -16,12 +16,14 @@ export function ReviewDialog({
   onClose,
   workspace,
   onRefresh,
+  beforeAction,
   demo,
 }: {
   open: boolean;
   onClose: () => void;
   workspace: Workspace;
   onRefresh: () => Promise<void>;
+  beforeAction: () => Promise<void>;
   demo: boolean;
 }) {
   const [editing, setEditing] = useState(false),
@@ -62,6 +64,7 @@ export function ReviewDialog({
     setBusy("Saving your criteria");
     setError("");
     try {
+      await beforeAction();
       await api(`/api/sessions/${workspace.session.id}/rubric`, {
         method: "POST",
         body: JSON.stringify({
@@ -100,6 +103,7 @@ export function ReviewDialog({
     setBusy("Reviewing every page in your scope");
     setError("");
     try {
+      await beforeAction();
       await api(`/api/sessions/${workspace.session.id}/review`, {
         method: "POST",
         body: JSON.stringify({ challenge_of: challenge ? review?.id : null }),
@@ -115,6 +119,7 @@ export function ReviewDialog({
     setBusy("Saving your final version");
     setError("");
     try {
+      await beforeAction();
       await api(`/api/sessions/${workspace.session.id}/submit`, {
         method: "POST",
         body: JSON.stringify({
@@ -163,6 +168,7 @@ export function ReviewDialog({
                   onClick={async () => {
                     setBusy("Reading your uploaded rubric");
                     try {
+                      await beforeAction();
                       const r = await api<{
                         criteria: {
                           description: string;
